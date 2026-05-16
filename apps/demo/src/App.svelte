@@ -1,5 +1,6 @@
 <script lang="ts">
   import Circle from "lucide-svelte/icons/circle";
+  import Database from "lucide-svelte/icons/database";
   import Link2 from "lucide-svelte/icons/link-2";
   import MousePointer2 from "lucide-svelte/icons/mouse-pointer-2";
   import Plus from "lucide-svelte/icons/plus";
@@ -7,8 +8,9 @@
   import Trash2 from "lucide-svelte/icons/trash-2";
   import Wifi from "lucide-svelte/icons/wifi";
   import WifiOff from "lucide-svelte/icons/wifi-off";
+  import { onMount } from "svelte";
   import { createOculusRoomStore } from "@oculus/svelte";
-  import { client, userColor, userId, userName } from "./collab";
+  import { client, serverUrl, userColor, userId, userName } from "./collab";
 
   type WorkflowNode = {
     id: string;
@@ -29,6 +31,13 @@
     edges?: Record<string, WorkflowEdge>;
   };
 
+  type StorageInfo = {
+    backend: "memory" | "postgres";
+    eventCount: number;
+    latestSnapshotVersion: number | null;
+    loadedVersion: number;
+  };
+
   const roomId = "workflow_123";
   const room = createOculusRoomStore<WorkflowState>(client, roomId);
   const { state, version, connected, users, cursors, events } = room;
@@ -38,11 +47,24 @@
   let connectFrom: string | null = null;
   let previewVersion: number | null = null;
   let previewState: WorkflowState | null = null;
+  let storageInfo: StorageInfo | null = null;
+  let storageError: string | null = null;
 
   $: visibleState = previewState ?? $state;
   $: nodes = Object.values(visibleState.nodes ?? {});
   $: edges = Object.values(visibleState.edges ?? {});
   $: collaborators = $users.filter((user) => user.userId !== userId);
+  $: snapshotLabel =
+    storageInfo?.latestSnapshotVersion === null || storageInfo?.latestSnapshotVersion === undefined
+      ? "pending"
+      : `v${storageInfo.latestSnapshotVersion}`;
+  $: if ($version >= 0) {
+    void refreshStorageInfo();
+  }
+
+  onMount(() => {
+    void refreshStorageInfo();
+  });
 
   async function addNode() {
     const id = `node_${crypto.randomUUID().slice(0, 8)}`;
@@ -85,6 +107,18 @@
   function clearReplay() {
     previewVersion = null;
     previewState = null;
+  }
+
+  async function refreshStorageInfo() {
+    try {
+      const response = await fetch(`${serverUrl}/rooms/${encodeURIComponent(roomId)}/storage`);
+      if (!response.ok) throw new Error(`storage request failed with ${response.status}`);
+      storageInfo = (await response.json()) as StorageInfo;
+      storageError = null;
+    } catch (error) {
+      storageInfo = null;
+      storageError = error instanceof Error ? error.message : "Unable to load storage status";
+    }
   }
 
   function updatePointerPresence(event: MouseEvent) {
@@ -228,6 +262,18 @@
       <div class="metric">
         <span>Users</span>
         <strong>{Math.max($users.length, 1)}</strong>
+      </div>
+      <div class="storage-card">
+        <div>
+          <Database size={16} />
+          <strong>{storageInfo?.backend === "postgres" ? "Postgres" : "Memory"}</strong>
+        </div>
+        {#if storageError}
+          <span class="storage-error">{storageError}</span>
+        {:else}
+          <span>{storageInfo?.eventCount ?? $events.length} durable events</span>
+          <span>Snapshot {snapshotLabel}</span>
+        {/if}
       </div>
     </section>
 

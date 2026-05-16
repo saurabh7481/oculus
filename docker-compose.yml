@@ -1,11 +1,31 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: oculus
+      POSTGRES_USER: oculus
+      POSTGRES_PASSWORD: oculus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oculus -d oculus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   server:
     build: .
     command: bun run server
     environment:
       PORT: "3000"
+      DATABASE_URL: postgres://oculus:oculus@postgres:5432/oculus
     ports:
       - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   demo:
     build: .
@@ -16,3 +36,6 @@ services:
       - "5173:5173"
     depends_on:
       - server
+
+volumes:
+  postgres_data:

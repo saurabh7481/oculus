@@ -1,8 +1,14 @@
 import {
   MemoryEventStore,
   RoomCoordinator,
+  type EventStore,
   type Operation
 } from "./coordinator";
+import postgres from "postgres";
+import {
+  migratePostgresEventStore,
+  PostgresEventStore
+} from "./postgres-store";
 import type { ClientMessage, ServerMessage } from "./protocol";
 
 type ClientContext = {
@@ -16,7 +22,7 @@ type ClientContext = {
 type OculusSocket = Bun.ServerWebSocket<ClientContext>;
 
 const PORT = Number(Bun.env.PORT ?? 3000);
-const store = new MemoryEventStore();
+const { store, storageBackend } = await createStore();
 const coordinator = new RoomCoordinator(store);
 const sockets = new Set<OculusSocket>();
 
@@ -79,7 +85,7 @@ Bun.serve<ClientContext>({
     }
 
     if (url.pathname === "/health") {
-      return json({ ok: true, service: "oculus-server", runtime: "bun" });
+      return json({ ok: true, service: "oculus-server", runtime: "bun", storage: storageBackend });
     }
 
     const eventsMatch = url.pathname.match(/^\/rooms\/([^/]+)\/events$/);
@@ -95,6 +101,19 @@ Bun.serve<ClientContext>({
       return json({
         version,
         state: await coordinator.replayAt(roomId, version)
+      });
+    }
+
+    const storageMatch = url.pathname.match(/^\/rooms\/([^/]+)\/storage$/);
+    if (storageMatch) {
+      const roomId = decodeURIComponent(storageMatch[1] ?? "");
+      const events = await coordinator.getEvents(roomId, 0);
+      const latestSnapshot = await store.getLatestSnapshot(roomId);
+      return json({
+        backend: storageBackend,
+        eventCount: events.length,
+        latestSnapshotVersion: latestSnapshot?.version ?? null,
+        loadedVersion: coordinator.getRoomVersion(roomId)
       });
     }
 
@@ -238,4 +257,17 @@ function corsHeaders(): Record<string, string> {
   };
 }
 
-console.log(`Oculus coordinator listening on http://0.0.0.0:${PORT}`);
+async function createStore(): Promise<{ store: EventStore; storageBackend: "memory" | "postgres" }> {
+  const databaseUrl = Bun.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return { store: new MemoryEventStore(), storageBackend: "memory" };
+  }
+
+  const sql = postgres(databaseUrl, { max: 10 });
+  await migratePostgresEventStore(sql);
+  return { store: new PostgresEventStore(sql), storageBackend: "postgres" };
+}
+
+console.log(
+  `Oculus coordinator listening on http://0.0.0.0:${PORT} using ${storageBackend} storage`
+);

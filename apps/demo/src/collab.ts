@@ -23,7 +23,9 @@ export const userId = sessionValue("oculus_demo_user_id", () =>
   `${userName.toLowerCase()}-${Math.random().toString(36).slice(2, 7)}`
 );
 
+export const serverUrl = import.meta.env.VITE_OCULUS_SERVER_URL ?? "http://localhost:3000";
+
 export const client = createClient({
-  serverUrl: import.meta.env.VITE_OCULUS_SERVER_URL ?? "http://localhost:3000",
+  serverUrl,
   userId
 });

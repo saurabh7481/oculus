@@ -11,6 +11,7 @@
     "test": "vitest run packages/server/test"
   },
   "dependencies": {
+    "postgres": "^3.4.9",
     "yjs": "^13.6.20",
     "zod": "^3.24.1"
   }

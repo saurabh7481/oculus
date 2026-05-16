@@ -51,6 +51,10 @@ export interface EventStore {
   saveInitialState(roomId: string, state: Record<string, unknown>): Promise<void>;
   appendEvent(event: RoomEvent): Promise<void>;
   getEvents(roomId: string, afterVersion?: number): Promise<RoomEvent[]>;
+  getLatestSnapshot(
+    roomId: string,
+    atOrBeforeVersion?: number
+  ): Promise<{ version: number; state: Record<string, unknown> } | undefined>;
   saveSnapshot(roomId: string, version: number, state: Record<string, unknown>): Promise<void>;
 }
 
@@ -82,6 +86,16 @@ export class MemoryEventStore implements EventStore {
       .map((event) => ({ ...event, operations: clone(event.operations) }));
   }
 
+  async getLatestSnapshot(
+    roomId: string,
+    atOrBeforeVersion = Number.POSITIVE_INFINITY
+  ): Promise<{ version: number; state: Record<string, unknown> } | undefined> {
+    const snapshot = (this.snapshots.get(roomId) ?? [])
+      .filter((candidate) => candidate.version <= atOrBeforeVersion)
+      .sort((a, b) => b.version - a.version)[0];
+    return snapshot ? { version: snapshot.version, state: clone(snapshot.state) } : undefined;
+  }
+
   async saveSnapshot(
     roomId: string,
     version: number,
@@ -96,6 +110,7 @@ export class MemoryEventStore implements EventStore {
 export class RoomCoordinator {
   private rooms = new Map<string, RoomCacheEntry>();
   private collectionConfigs = new Map<string, CollectionConfig>();
+  private mutationQueues = new Map<string, Promise<void>>();
 
   constructor(private readonly store: EventStore = new MemoryEventStore()) {}
 
@@ -121,9 +136,10 @@ export class RoomCoordinator {
     const initialState = (await this.store.loadInitialState(roomId)) ?? clone(defaultState);
     await this.store.saveInitialState(roomId, initialState);
 
-    let version = 0;
-    let state = clone(initialState);
-    for (const event of await this.store.getEvents(roomId, 0)) {
+    const snapshot = await this.store.getLatestSnapshot(roomId);
+    let version = snapshot?.version ?? 0;
+    let state = snapshot ? clone(snapshot.state) : clone(initialState);
+    for (const event of await this.store.getEvents(roomId, version)) {
       state = this.applyOperations(state, event.operations, {
         roomId,
         currentVersion: version,
@@ -161,6 +177,25 @@ export class RoomCoordinator {
       }
     | { status: "rejected"; reason: string }
   > {
+    return this.withRoomMutationQueue(params.roomId, () => this.applyMutationUnlocked(params));
+  }
+
+  private async applyMutationUnlocked(params: {
+    roomId: string;
+    userId: string;
+    clientId: string;
+    operationId: string;
+    baseVersion: number;
+    operations: Operation[];
+  }): Promise<
+    | {
+        status: "accepted";
+        serverVersion: number;
+        transformedOperations: Operation[];
+        state: Record<string, unknown>;
+      }
+    | { status: "rejected"; reason: string }
+  > {
     const room = this.rooms.get(params.roomId);
     if (!room) {
       return { status: "rejected", reason: "room_not_loaded" };
@@ -182,15 +217,19 @@ export class RoomCoordinator {
       timestamp
     });
 
-    await this.store.appendEvent({
-      roomId: params.roomId,
-      userId: params.userId,
-      clientId: params.clientId,
-      operationId: params.operationId,
-      version: serverVersion,
-      operations: transformedOperations,
-      timestamp
-    });
+    try {
+      await this.store.appendEvent({
+        roomId: params.roomId,
+        userId: params.userId,
+        clientId: params.clientId,
+        operationId: params.operationId,
+        version: serverVersion,
+        operations: transformedOperations,
+        timestamp
+      });
+    } catch {
+      return { status: "rejected", reason: "event_persist_failed" };
+    }
 
     room.version = serverVersion;
     room.state = nextState;
@@ -206,6 +245,27 @@ export class RoomCoordinator {
       transformedOperations,
       state: clone(nextState)
     };
+  }
+
+  private async withRoomMutationQueue<T>(roomId: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.mutationQueues.get(roomId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const queued = previous.catch(() => undefined).then(() => current);
+    this.mutationQueues.set(roomId, queued);
+
+    await previous.catch(() => undefined);
+
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.mutationQueues.get(roomId) === queued) {
+        this.mutationQueues.delete(roomId);
+      }
+    }
   }
 
   getRoomState(roomId: string): Record<string, unknown> | undefined {
@@ -263,9 +323,10 @@ export class RoomCoordinator {
     const room = this.rooms.get(roomId);
     const initialState =
       room?.initialState ?? (await this.store.loadInitialState(roomId)) ?? {};
-    let state = clone(initialState);
+    const snapshot = await this.store.getLatestSnapshot(roomId, version);
+    let state = snapshot ? clone(snapshot.state) : clone(initialState);
 
-    for (const event of await this.store.getEvents(roomId, 0)) {
+    for (const event of await this.store.getEvents(roomId, snapshot?.version ?? 0)) {
       if (event.version > version) break;
       state = this.applyOperations(state, event.operations, {
         roomId,

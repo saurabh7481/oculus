@@ -234,6 +234,36 @@ button:hover {
   font-size: 20px;
 }
 
+.storage-card {
+  margin-top: 14px;
+  padding: 12px;
+  display: grid;
+  gap: 6px;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #1e3a8a;
+  font-size: 13px;
+}
+
+.storage-card div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.storage-card strong {
+  color: #1e40af;
+}
+
+.storage-card span {
+  color: #475569;
+}
+
+.storage-error {
+  color: #b91c1c;
+}
+
 .people {
   list-style: none;
   padding: 0;
