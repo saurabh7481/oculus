@@ -10,11 +10,11 @@ This repository now contains the first runnable slice of Oculus:
 ## Run Locally
 
 ```bash
-pnpm install
-pnpm test
-pnpm run build
-pnpm run server
-pnpm run demo
+bun install
+bun run test
+bun run build
+bun run server
+bun run demo
 ```
 
 Open `http://localhost:5173` in two browser tabs. Move nodes, edit labels, create links, and watch the event history update.

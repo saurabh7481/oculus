@@ -4,14 +4,18 @@
   "private": true,
   "description": "Realtime multiuser collaboration and syncing SDK.",
   "type": "module",
-  "packageManager": "pnpm@10.16.1",
+  "packageManager": "bun@1.2.23",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
-    "dev": "pnpm -r --parallel --if-present dev",
-    "build": "pnpm --filter @oculus/sdk build && pnpm --filter @oculus/svelte build && pnpm --filter @oculus/server build && pnpm --filter @oculus/demo build",
+    "dev": "bun run --workspaces --filter '*' dev",
+    "build": "bun run --filter @oculus/sdk build && bun run --filter @oculus/svelte build && bun run --filter @oculus/server build && bun run --filter @oculus/demo build",
     "test": "vitest run",
     "typecheck": "tsc -b packages/server packages/sdk packages/svelte apps/demo",
-    "server": "pnpm --filter @oculus/server dev",
-    "demo": "pnpm --filter @oculus/demo dev"
+    "server": "bun run --filter @oculus/server dev",
+    "demo": "bun run --filter @oculus/demo dev"
   },
   "devDependencies": {
     "@types/bun": "^1.2.23",

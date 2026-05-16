@@ -1,7 +1,7 @@
 services:
   server:
     build: .
-    command: pnpm run server
+    command: bun run server
     environment:
       PORT: "3000"
     ports:
@@ -9,7 +9,7 @@ services:
 
   demo:
     build: .
-    command: pnpm run demo
+    command: bun run demo
     environment:
       VITE_OCULUS_SERVER_URL: http://localhost:3000
     ports:
