@@ -1,7 +1,6 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "jsx": "react-jsx",
     "outDir": "dist-ts",
     "types": ["vite/client"],
     "composite": true,
@@ -9,7 +8,7 @@
   },
   "references": [
     { "path": "../../packages/sdk" },
-    { "path": "../../packages/react" }
+    { "path": "../../packages/svelte" }
   ],
-  "include": ["src", "vite.config.ts"]
+  "include": ["src", "vite.config.ts", "svelte.config.js"]
 }

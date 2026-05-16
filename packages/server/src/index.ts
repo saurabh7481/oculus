@@ -1,6 +1,3 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
-import { WebSocketServer, type WebSocket } from "ws";
 import {
   MemoryEventStore,
   RoomCoordinator,
@@ -12,12 +9,16 @@ type ClientContext = {
   roomId: string;
   userId: string;
   clientId: string;
+  initialVersion: number;
+  initialState: Record<string, unknown>;
 };
 
-const PORT = Number(process.env.PORT ?? 3000);
+type OculusSocket = Bun.ServerWebSocket<ClientContext>;
+
+const PORT = Number(Bun.env.PORT ?? 3000);
 const store = new MemoryEventStore();
 const coordinator = new RoomCoordinator(store);
-const sockets = new Map<WebSocket, ClientContext>();
+const sockets = new Set<OculusSocket>();
 
 coordinator.defineCollection("nodes", {
   fields: {
@@ -46,118 +47,115 @@ const demoState = {
   }
 };
 
-const server = createServer(async (req, res) => {
-  setCorsHeaders(res);
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-
-  if (url.pathname === "/health") {
-    sendJson(res, 200, { ok: true, service: "oculus-server" });
-    return;
-  }
-
-  const eventsMatch = url.pathname.match(/^\/rooms\/([^/]+)\/events$/);
-  if (eventsMatch) {
-    const roomId = decodeURIComponent(eventsMatch[1] ?? "");
-    sendJson(res, 200, { events: await coordinator.getEvents(roomId, 0) });
-    return;
-  }
-
-  const replayMatch = url.pathname.match(/^\/rooms\/([^/]+)\/replay\/(\d+)$/);
-  if (replayMatch) {
-    const roomId = decodeURIComponent(replayMatch[1] ?? "");
-    const version = Number(replayMatch[2]);
-    sendJson(res, 200, {
-      version,
-      state: await coordinator.replayAt(roomId, version)
-    });
-    return;
-  }
-
-  sendJson(res, 404, { error: "not_found" });
-});
-
-const wss = new WebSocketServer({ noServer: true });
-
-server.on("upgrade", (req, socket, head) => {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-  const match = url.pathname.match(/^\/rooms\/([^/]+)$/);
-
-  if (!match) {
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req, decodeURIComponent(match[1] ?? ""));
-  });
-});
-
-wss.on("connection", async (ws: WebSocket, req: IncomingMessage, roomId: string) => {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-  const userId = url.searchParams.get("userId") || `user-${randomUUID().slice(0, 8)}`;
-  const clientId = url.searchParams.get("clientId") || randomUUID();
-
-  const roomState = await coordinator.loadRoom(roomId, roomId === "workflow_123" ? demoState : {});
-  coordinator.onClientJoin(roomId, userId, clientId);
-  sockets.set(ws, { roomId, userId, clientId });
-
-  send(ws, {
-    type: "room_init",
-    version: roomState.version,
-    state: roomState.state,
-    connectedUsers: coordinator.getConnectedUsers(roomId)
-  });
-  broadcastUsers(roomId, "joined", userId, clientId);
-
-  ws.on("message", async (raw) => {
-    const context = sockets.get(ws);
-    if (!context) return;
-
-    let message: ClientMessage;
-    try {
-      message = JSON.parse(String(raw));
-    } catch {
-      return;
+Bun.serve<ClientContext>({
+  port: PORT,
+  hostname: "0.0.0.0",
+  async fetch(request, server) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    if (message.type === "mutation") {
-      await handleMutation(ws, context, message);
+    const url = new URL(request.url);
+    const roomMatch = url.pathname.match(/^\/rooms\/([^/]+)$/);
+    if (roomMatch && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const roomId = decodeURIComponent(roomMatch[1] ?? "");
+      const userId = url.searchParams.get("userId") || `user-${crypto.randomUUID().slice(0, 8)}`;
+      const clientId = url.searchParams.get("clientId") || crypto.randomUUID();
+      const roomState = await coordinator.loadRoom(
+        roomId,
+        roomId === "workflow_123" ? demoState : {}
+      );
+
+      const upgraded = server.upgrade(request, {
+        data: {
+          roomId,
+          userId,
+          clientId,
+          initialVersion: roomState.version,
+          initialState: roomState.state
+        }
+      });
+      return upgraded ? undefined : json({ error: "upgrade_failed" }, 500);
     }
 
-    if (message.type === "presence") {
-      coordinator.updatePresence(context.roomId, context.clientId, message.data);
-      broadcast(context.roomId, {
-        type: "presence_broadcast",
-        userId: context.userId,
-        clientId: context.clientId,
-        data: message.data,
-        ts: Date.now()
-      }, ws);
+    if (url.pathname === "/health") {
+      return json({ ok: true, service: "oculus-server", runtime: "bun" });
     }
-  });
 
-  ws.on("close", async () => {
-    sockets.delete(ws);
-    await coordinator.onClientLeave(roomId, clientId);
-    broadcastUsers(roomId, "left", userId, clientId);
-  });
+    const eventsMatch = url.pathname.match(/^\/rooms\/([^/]+)\/events$/);
+    if (eventsMatch) {
+      const roomId = decodeURIComponent(eventsMatch[1] ?? "");
+      return json({ events: await coordinator.getEvents(roomId, 0) });
+    }
+
+    const replayMatch = url.pathname.match(/^\/rooms\/([^/]+)\/replay\/(\d+)$/);
+    if (replayMatch) {
+      const roomId = decodeURIComponent(replayMatch[1] ?? "");
+      const version = Number(replayMatch[2]);
+      return json({
+        version,
+        state: await coordinator.replayAt(roomId, version)
+      });
+    }
+
+    return json({ error: "not_found" }, 404);
+  },
+  websocket: {
+    data: {} as ClientContext,
+    open(ws) {
+      sockets.add(ws);
+      coordinator.onClientJoin(ws.data.roomId, ws.data.userId, ws.data.clientId);
+      send(ws, {
+        type: "room_init",
+        version: ws.data.initialVersion,
+        state: ws.data.initialState,
+        connectedUsers: coordinator.getConnectedUsers(ws.data.roomId)
+      });
+      broadcastUsers(ws.data.roomId, "joined", ws.data.userId, ws.data.clientId);
+    },
+    async message(ws, raw) {
+      let message: ClientMessage;
+      try {
+        message = JSON.parse(String(raw));
+      } catch {
+        return;
+      }
+
+      if (message.type === "mutation") {
+        await handleMutation(ws, message);
+      }
+
+      if (message.type === "presence") {
+        coordinator.updatePresence(ws.data.roomId, ws.data.clientId, message.data);
+        broadcast(
+          ws.data.roomId,
+          {
+            type: "presence_broadcast",
+            userId: ws.data.userId,
+            clientId: ws.data.clientId,
+            data: message.data,
+            ts: Date.now()
+          },
+          ws
+        );
+      }
+    },
+    async close(ws) {
+      sockets.delete(ws);
+      await coordinator.onClientLeave(ws.data.roomId, ws.data.clientId);
+      broadcastUsers(ws.data.roomId, "left", ws.data.userId, ws.data.clientId);
+    }
+  }
 });
 
 async function handleMutation(
-  ws: WebSocket,
-  context: ClientContext,
+  ws: OculusSocket,
   message: Extract<ClientMessage, { type: "mutation" }>
 ): Promise<void> {
   const result = await coordinator.applyMutation({
-    roomId: context.roomId,
-    userId: context.userId,
-    clientId: context.clientId,
+    roomId: ws.data.roomId,
+    userId: ws.data.userId,
+    clientId: ws.data.clientId,
     operationId: message.operationId,
     baseVersion: message.baseVersion,
     operations: message.operations
@@ -181,14 +179,18 @@ async function handleMutation(
     status: "accepted"
   });
 
-  broadcast(context.roomId, {
-    type: "mutation_broadcast",
-    roomId: context.roomId,
-    serverVersion: result.serverVersion,
-    userId: context.userId,
-    clientId: context.clientId,
-    operations: result.transformedOperations as Operation[]
-  }, ws);
+  broadcast(
+    ws.data.roomId,
+    {
+      type: "mutation_broadcast",
+      roomId: ws.data.roomId,
+      serverVersion: result.serverVersion,
+      userId: ws.data.userId,
+      clientId: ws.data.clientId,
+      operations: result.transformedOperations as Operation[]
+    },
+    ws
+  );
 }
 
 function broadcastUsers(
@@ -206,31 +208,34 @@ function broadcastUsers(
   });
 }
 
-function broadcast(roomId: string, message: ServerMessage, except?: WebSocket): void {
-  for (const [socket, context] of sockets.entries()) {
-    if (context.roomId === roomId && socket !== except && socket.readyState === socket.OPEN) {
+function broadcast(roomId: string, message: ServerMessage, except?: OculusSocket): void {
+  for (const socket of sockets) {
+    if (socket.data.roomId === roomId && socket !== except) {
       send(socket, message);
     }
   }
 }
 
-function send(socket: WebSocket, message: ServerMessage): void {
-  if (socket.readyState === socket.OPEN) {
-    socket.send(JSON.stringify(message));
-  }
+function send(socket: OculusSocket, message: ServerMessage): void {
+  socket.send(JSON.stringify(message));
 }
 
-function sendJson(res: ServerResponse, status: number, payload: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(payload));
+function json(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "application/json"
+    }
+  });
 }
 
-function setCorsHeaders(res: ServerResponse): void {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+function corsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization"
+  };
 }
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Oculus coordinator listening on http://0.0.0.0:${PORT}`);
-});
+console.log(`Oculus coordinator listening on http://0.0.0.0:${PORT}`);

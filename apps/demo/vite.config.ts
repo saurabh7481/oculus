@@ -1,13 +1,13 @@
 import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { fileURLToPath, URL } from "node:url";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [svelte()],
   resolve: {
     alias: {
       "@oculus/sdk": fileURLToPath(new URL("../../packages/sdk/src/index.ts", import.meta.url)),
-      "@oculus/react": fileURLToPath(new URL("../../packages/react/src/index.ts", import.meta.url))
+      "@oculus/svelte": fileURLToPath(new URL("../../packages/svelte/src/index.ts", import.meta.url))
     }
   },
   server: {

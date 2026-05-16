@@ -5,8 +5,8 @@ Oculus is a standalone TypeScript SDK and realtime room server for building mult
 The initial implementation includes:
 
 - A room coordinator with field-level operations, versioning, event history, and replay snapshots.
-- A WebSocket gateway for realtime mutations and presence.
-- A browser SDK and React hook package.
+- A Bun-native WebSocket gateway for realtime mutations and presence.
+- A browser SDK and Svelte store package.
 - A collaborative workflow-builder demo designed for testing in multiple browser tabs.
 - Docker Compose for a runnable local stack.
 

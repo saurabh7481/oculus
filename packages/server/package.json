@@ -6,13 +6,11 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "dev": "tsx src/index.ts",
+    "dev": "bun run src/index.ts",
     "build": "tsc -p tsconfig.json",
     "test": "vitest run packages/server/test"
   },
   "dependencies": {
-    "tsx": "^4.19.2",
-    "ws": "^8.18.0",
     "yjs": "^13.6.20",
     "zod": "^3.24.1"
   }

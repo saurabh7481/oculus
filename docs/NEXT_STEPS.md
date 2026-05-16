@@ -2,19 +2,19 @@
 
 This repository now contains the first runnable slice of Oculus:
 
-- `packages/server`: in-memory room coordinator, WebSocket gateway, field-level operations, event log, replay endpoint, and presence fan-out.
+- `packages/server`: in-memory room coordinator, Bun-native WebSocket gateway, field-level operations, event log, replay endpoint, and presence fan-out.
 - `packages/sdk`: browser client with optimistic mutations, rollback on rejection, presence throttling, event history, replay fetches, and offline queueing for disconnected mutations.
-- `packages/react`: `useOculusRoom` hook for React apps.
-- `apps/demo`: collaborative workflow-builder canvas for testing multiple tabs against the same room.
+- `packages/svelte`: `createOculusRoomStore` for Svelte apps.
+- `apps/demo`: Svelte collaborative workflow-builder canvas for testing multiple tabs against the same room.
 
 ## Run Locally
 
 ```bash
-npm install
-npm test
-npm run build
-npm run server
-npm run demo
+pnpm install
+pnpm test
+pnpm run build
+pnpm run server
+pnpm run demo
 ```
 
 Open `http://localhost:5173` in two browser tabs. Move nodes, edit labels, create links, and watch the event history update.

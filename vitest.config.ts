@@ -9,7 +9,7 @@ export default defineConfig({
     alias: {
       "@oculus/server": new URL("./packages/server/src/index.ts", import.meta.url).pathname,
       "@oculus/sdk": new URL("./packages/sdk/src/index.ts", import.meta.url).pathname,
-      "@oculus/react": new URL("./packages/react/src/index.ts", import.meta.url).pathname
+      "@oculus/svelte": new URL("./packages/svelte/src/index.ts", import.meta.url).pathname
     }
   }
 });

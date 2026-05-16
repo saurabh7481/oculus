@@ -1,7 +1,7 @@
 services:
   server:
     build: .
-    command: npm run server
+    command: pnpm run server
     environment:
       PORT: "3000"
     ports:
@@ -9,7 +9,7 @@ services:
 
   demo:
     build: .
-    command: npm run demo
+    command: pnpm run demo
     environment:
       VITE_OCULUS_SERVER_URL: http://localhost:3000
     ports:

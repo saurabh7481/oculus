@@ -4,22 +4,18 @@
   "private": true,
   "description": "Realtime multiuser collaboration and syncing SDK.",
   "type": "module",
-  "workspaces": [
-    "packages/*",
-    "apps/*"
-  ],
+  "packageManager": "pnpm@10.16.1",
   "scripts": {
-    "dev": "npm run dev --workspaces --if-present",
-    "build": "npm run build -w @oculus/sdk && npm run build -w @oculus/react && npm run build -w @oculus/server && npm run build -w @oculus/demo",
+    "dev": "pnpm -r --parallel --if-present dev",
+    "build": "pnpm --filter @oculus/sdk build && pnpm --filter @oculus/svelte build && pnpm --filter @oculus/server build && pnpm --filter @oculus/demo build",
     "test": "vitest run",
-    "typecheck": "tsc -b packages/server packages/sdk packages/react apps/demo",
-    "server": "npm run dev -w @oculus/server",
-    "demo": "npm run dev -w @oculus/demo"
+    "typecheck": "tsc -b packages/server packages/sdk packages/svelte apps/demo",
+    "server": "pnpm --filter @oculus/server dev",
+    "demo": "pnpm --filter @oculus/demo dev"
   },
   "devDependencies": {
+    "@types/bun": "^1.2.23",
     "@types/node": "^22.10.2",
-    "@types/ws": "^8.5.13",
-    "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.2",
     "vite": "^6.0.3",
     "vitest": "^2.1.8"
