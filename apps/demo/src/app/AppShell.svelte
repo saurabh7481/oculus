@@ -24,8 +24,9 @@
     Wifi,
     WifiOff
   } from "lucide-svelte";
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { createOculusRoomStore } from "@oculus/svelte";
+  import { attachKeyboardShortcuts } from "./useKeyboardShortcuts";
   import type { Operation, ReplayDiff, RoomEvent } from "@oculus/sdk";
   import { client, serverUrl, userColor, userId, userName } from "../collab";
   import ResizeHandles from "../canvas/ResizeHandles.svelte";
@@ -158,6 +159,7 @@
   let canvasTransform: CanvasTransform = { x: 0, y: 0, scale: 1 };
   let spaceHeld = false;
   let panState: { startX: number; startY: number; originX: number; originY: number } | null = null;
+  let cleanupShortcuts: (() => void) | undefined;
 
   $: activeMeta = environments.find((environment) => environment.id === activeEnvironment) ?? environments[0];
   $: visibleState = previewState ?? $state;
@@ -204,7 +206,19 @@
     navCollapsed = localStorage.getItem("oculus_demo_nav_collapsed") === "true";
     inspectorCollapsed = localStorage.getItem("oculus_demo_inspector_collapsed") === "true";
     void refreshStorageInfo();
+    cleanupShortcuts = attachKeyboardShortcuts({
+      onDelete: () => void deleteSelected(),
+      onEscape: () => {
+        selected = null;
+        whiteboardTool = "select";
+      },
+      onDuplicate: () => void duplicateSelected(),
+      onUndo: () => void room.undo(),
+      onRedo: () => void room.redo()
+    });
   });
+
+  onDestroy(() => cleanupShortcuts?.());
 
   function uid(prefix: string): string {
     return `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
@@ -296,9 +310,10 @@
   }
 
   function startDrag(event: PointerEvent, collection: CollectionName, kind: SelectableKind, id: string, x: number, y: number) {
-    if (previewState || isFormTarget(event.target) || spaceHeld) return;
-    const point = canvasPoint(event);
+    if (previewState || spaceHeld) return;
     select(kind, id);
+    if (isFormTarget(event.target)) return; // select but don't drag when clicking into a textarea/input
+    const point = canvasPoint(event);
     drag = {
       collection,
       id,
@@ -670,6 +685,23 @@
       [{ op: "delete", path: `${collectionFor(target.kind)}.${target.id}` }],
       { kind: "delete", targetIds: [target.id] }
     );
+  }
+
+  async function duplicateSelected() {
+    if (!selected) return;
+    const target = selected;
+    const collection = collectionFor(target.kind);
+    const source = visibleState[collection]?.[target.id];
+    if (!source) return;
+    const newId = uid(target.kind === "node" ? "node" : ((source as WhiteboardShape).type ?? "shape"));
+    const copy = { ...source, id: newId, x: ((source as { x?: number }).x ?? 0) + 24, y: ((source as { y?: number }).y ?? 0) + 24 };
+    await room.transaction(
+      `Duplicate ${target.kind}`,
+      [{ op: "set", path: `${collection}.${newId}`, value: copy }],
+      { kind: "whiteboard", targetIds: [newId] }
+    );
+    (document.activeElement as HTMLElement)?.blur();
+    select(target.kind, newId);
   }
 
   async function rename(collection: CollectionName, id: string, field: "text" | "name" | "label", value: string) {
