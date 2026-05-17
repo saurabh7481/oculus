@@ -15,10 +15,8 @@
     Moon,
     MousePointer2,
     PenLine,
-    Plus,
     RectangleHorizontal,
     RotateCcw,
-    Sparkles,
     StickyNote,
     Sun,
     Trash2,
@@ -37,6 +35,9 @@
   import WhiteboardApp from "../whiteboard/WhiteboardApp.svelte";
   import WhiteboardToolbar from "../whiteboard/WhiteboardToolbar.svelte";
   import type { WhiteboardShape, WhiteboardTool } from "../whiteboard/whiteboard-model";
+  import WorkflowApp from "../workflow/WorkflowApp.svelte";
+  import WorkflowToolbar from "../workflow/WorkflowToolbar.svelte";
+  import type { WorkflowEdge, WorkflowNode } from "../workflow/workflow-model";
 
   type Environment = "whiteboard" | "design" | "workflow";
   type SelectableKind = "shape" | "frame" | "node";
@@ -53,23 +54,6 @@
     name: string;
     kind: "frame" | "component" | "asset";
     color: string;
-  };
-
-  type WorkflowNode = {
-    id: string;
-    x: number;
-    y: number;
-    width?: number;
-    height?: number;
-    label: string;
-    kind: "trigger" | "action" | "decision";
-    color?: string;
-  };
-
-  type WorkflowEdge = {
-    id: string;
-    source: string;
-    target: string;
   };
 
   type AssetReference = {
@@ -809,11 +793,12 @@
         <button on:click={() => addFrame("asset")}><FileImage size={16} /> Add asset</button>
         <button class="danger" disabled={!selected} on:click={deleteSelected}><Trash2 size={16} /> Delete selected</button>
       {:else}
-        <button class="primary" on:click={() => addNode("action")}><Plus size={16} /> Add node</button>
-        <button on:click={() => addNode("trigger")}><Sparkles size={16} /> Trigger</button>
-        <button on:click={() => addNode("decision")}><GitBranch size={16} /> Decision</button>
-        <button on:click={connectLatestNodes}><Link2 size={16} /> Link latest</button>
-        <button class="danger" disabled={!selected} on:click={deleteSelected}><Trash2 size={16} /> Delete selected</button>
+        <WorkflowToolbar
+          selected={Boolean(selected)}
+          onAddNode={(kind) => void addNode(kind)}
+          onConnectLatest={() => void connectLatestNodes()}
+          onDeleteSelected={() => void deleteSelected()}
+        />
       {/if}
       <span class="room-chip"><Code2 size={14} /> {roomId}</span>
     </div>
@@ -883,72 +868,26 @@
           {/if}
         </div>
       {:else}
-        <div class="workflow-stage" data-testid="workflow-board">
-          <svg class="edges">
-            {#each edges as edge (edge.id)}
-              {@const source = visibleState.nodes?.[edge.source]}
-              {@const target = visibleState.nodes?.[edge.target]}
-              {#if source && target}
-                {@const sourcePosition = draftPosition("nodes", source.id, source)}
-                {@const targetPosition = draftPosition("nodes", target.id, target)}
-                <line
-                  data-testid="workflow-edge"
-                  x1={sourcePosition.x + 156}
-                  y1={sourcePosition.y + 34}
-                  x2={targetPosition.x}
-                  y2={targetPosition.y + 34}
-                />
-              {/if}
-            {/each}
-            {#if linkDrag}
-              {@const source = visibleState.nodes?.[linkDrag.sourceId]}
-              {#if source}
-                {@const sourcePosition = draftPosition("nodes", source.id, source)}
-                <line class="preview-edge" x1={sourcePosition.x + 156} y1={sourcePosition.y + 34} x2={linkDrag.x} y2={linkDrag.y} />
-              {/if}
-            {/if}
-          </svg>
-          {#each nodes as node (node.id)}
-            {@const rect = draftRect("nodes", node.id, node, { width: 166, height: 68 })}
-            <article
-              data-object
-              data-node-id={node.id}
-              data-testid="workflow-node"
-              data-x={Math.round(rect.x)}
-              class={`workflow-node ${node.kind} ${selectedClass("node", node.id)}`}
-              style={`left: ${rect.x}px; top: ${rect.y}px; width: ${rect.width}px; min-height: ${rect.height}px; border-color: ${node.color ?? "#2563eb"}`}
-              on:pointerdown={(event) => startDrag(event, "nodes", "node", node.id, rect.x, rect.y)}
-            >
-              <span class="node-dot" style={`background: ${node.color ?? "#2563eb"}`}></span>
-              <input
-                data-testid="node-label"
-                value={node.label}
-                disabled={Boolean(previewState)}
-                on:input={(event) => void rename("nodes", node.id, "label", event.currentTarget.value)}
-                on:focus={() =>
-                  room.updatePresence({
-                    environment: activeEnvironment,
-                    editing: `nodes.${node.id}.label`,
-                    name: userName,
-                    color: userColor
-                  })}
-              />
-              <button class="connect-handle" aria-label={`Connect ${node.label}`} on:pointerdown={(event) => startLink(event, node.id)}>
-                <Link2 size={13} />
-              </button>
-              {#if selected?.kind === "node" && selected.id === node.id}
-                <ResizeHandles onResizeStart={(handle, event) => startResize(event, "nodes", "node", node.id, handle, rect)} />
-              {/if}
-            </article>
-          {/each}
-          {#if nodes.length === 0}
-            <div class="empty-state">
-              <GitBranch size={26} />
-              <strong>Build a process</strong>
-              <span>Add nodes, drag handles to connect them, and delete nodes when the flow changes.</span>
-            </div>
-          {/if}
-        </div>
+        <WorkflowApp
+          {nodes}
+          {edges}
+          selected={selected?.kind === "node" ? { kind: "node", id: selected.id } : null}
+          {drag}
+          {resize}
+          {linkDrag}
+          previewState={Boolean(previewState)}
+          onStartDrag={(event, id, x, y) => startDrag(event, "nodes", "node", id, x, y)}
+          onStartResize={(event, id, handle, rect) => startResize(event, "nodes", "node", id, handle, rect)}
+          onRename={(id, field, value) => void rename("nodes", id, field, value)}
+          onStartLink={(event, sourceId) => startLink(event, sourceId)}
+          onFocusLabel={(id) =>
+            room.updatePresence({
+              environment: activeEnvironment,
+              editing: `nodes.${id}.label`,
+              name: userName,
+              color: userColor
+            })}
+        />
       {/if}
 
       {#each Object.entries($cursors) as [clientId, cursor] (clientId)}
