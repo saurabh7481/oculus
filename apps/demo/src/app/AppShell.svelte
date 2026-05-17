@@ -31,6 +31,12 @@
   import ResizeHandles from "../canvas/ResizeHandles.svelte";
   import { resizeFromHandle, type ResizeHandle } from "../canvas/useResize";
   import type { Rect } from "../canvas/geometry";
+  import {
+    panTransform,
+    resetTransform,
+    zoomTransform,
+    type CanvasTransform
+  } from "../canvas/useCanvasTransform";
   import Dialog from "../ui/dialog/Dialog.svelte";
   import WhiteboardApp from "../whiteboard/WhiteboardApp.svelte";
   import WhiteboardToolbar from "../whiteboard/WhiteboardToolbar.svelte";
@@ -149,6 +155,9 @@
   let replayError: string | null = null;
   let storageInfo: StorageInfo | null = null;
   let storageError: string | null = null;
+  let canvasTransform: CanvasTransform = { x: 0, y: 0, scale: 1 };
+  let spaceHeld = false;
+  let panState: { startX: number; startY: number; originX: number; originY: number } | null = null;
 
   $: activeMeta = environments.find((environment) => environment.id === activeEnvironment) ?? environments[0];
   $: visibleState = previewState ?? $state;
@@ -205,6 +214,8 @@
     activeEnvironment = environment;
     selected = null;
     whiteboardTool = "select";
+    spaceHeld = false;
+    panState = null;
     room.updatePresence({ environment, name: userName, color: userColor }, { throttle: 0 });
   }
 
@@ -261,6 +272,17 @@
   function canvasPoint(event: PointerEvent | MouseEvent): Point {
     const rect = document.querySelector<HTMLElement>("[data-testid='studio-canvas']")?.getBoundingClientRect();
     if (!rect) return { x: 0, y: 0 };
+    const screenX = event.clientX - rect.left;
+    const screenY = event.clientY - rect.top;
+    return {
+      x: (screenX - canvasTransform.x) / canvasTransform.scale,
+      y: (screenY - canvasTransform.y) / canvasTransform.scale
+    };
+  }
+
+  function screenPointInCanvas(event: PointerEvent | MouseEvent | WheelEvent): Point {
+    const rect = document.querySelector<HTMLElement>("[data-testid='studio-canvas']")?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   }
 
@@ -274,7 +296,7 @@
   }
 
   function startDrag(event: PointerEvent, collection: CollectionName, kind: SelectableKind, id: string, x: number, y: number) {
-    if (previewState || isFormTarget(event.target)) return;
+    if (previewState || isFormTarget(event.target) || spaceHeld) return;
     const point = canvasPoint(event);
     select(kind, id);
     drag = {
@@ -288,8 +310,61 @@
     event.preventDefault();
   }
 
+  function handleCanvasWheel(event: WheelEvent) {
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault();
+      const origin = screenPointInCanvas(event);
+      // deltaY < 0 means zoom-in (positive zoom delta)
+      canvasTransform = zoomTransform(canvasTransform, -event.deltaY, origin);
+    } else {
+      event.preventDefault();
+      canvasTransform = panTransform(canvasTransform, { x: -event.deltaX, y: -event.deltaY });
+    }
+  }
+
+  function handleCanvasPointerDown(event: PointerEvent) {
+    if (spaceHeld) {
+      event.preventDefault();
+      panState = {
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: canvasTransform.x,
+        originY: canvasTransform.y
+      };
+      return;
+    }
+    startDrawing(event);
+  }
+
+  function handleWindowKeyDown(event: KeyboardEvent) {
+    if (event.code === "Space" && !spaceHeld && !isFormTarget(event.target)) {
+      spaceHeld = true;
+      event.preventDefault();
+      return;
+    }
+    if (event.shiftKey && (event.key === "0" || event.code === "Digit0") && !isFormTarget(event.target)) {
+      event.preventDefault();
+      canvasTransform = resetTransform();
+    }
+  }
+
+  function handleWindowKeyUp(event: KeyboardEvent) {
+    if (event.code === "Space") {
+      spaceHeld = false;
+      panState = null;
+    }
+  }
+
   function handlePointerMove(event: PointerEvent) {
     updatePointerPresence(event);
+    if (panState) {
+      canvasTransform = {
+        ...canvasTransform,
+        x: panState.originX + (event.clientX - panState.startX),
+        y: panState.originY + (event.clientY - panState.startY)
+      };
+      return;
+    }
     if (drawing) {
       drawing = { ...drawing, points: [...drawing.points, canvasPoint(event)] };
       return;
@@ -320,6 +395,10 @@
   }
 
   function handlePointerUp(event: PointerEvent) {
+    if (panState) {
+      panState = null;
+      return;
+    }
     if (drawing) {
       void commitDrawing();
       return;
@@ -448,6 +527,7 @@
   }
 
   function startDrawing(event: PointerEvent) {
+    if (spaceHeld) return;
     if (activeEnvironment !== "whiteboard" || whiteboardTool !== "pencil" || previewState) return;
     if ((event.target as HTMLElement).closest("[data-object]")) return;
     drawing = { color: userColor, points: [canvasPoint(event)] };
@@ -680,7 +760,12 @@
   }
 </script>
 
-<svelte:window on:pointermove={handlePointerMove} on:pointerup={handlePointerUp} />
+<svelte:window
+  on:pointermove={handlePointerMove}
+  on:pointerup={handlePointerUp}
+  on:keydown={handleWindowKeyDown}
+  on:keyup={handleWindowKeyUp}
+/>
 
 <main
   class="studio-shell"
@@ -815,80 +900,86 @@
     {/if}
 
     <div
-      class={`canvas-surface ${activeEnvironment} ${whiteboardTool === "pencil" ? "drawing-mode" : ""}`}
+      class={`canvas-surface ${activeEnvironment} ${whiteboardTool === "pencil" ? "drawing-mode" : ""} ${spaceHeld ? "pan-mode" : ""}`}
       data-testid="studio-canvas"
       role="application"
-      on:pointerdown={startDrawing}
+      on:pointerdown={handleCanvasPointerDown}
+      on:wheel|nonpassive={handleCanvasWheel}
     >
-      {#if activeEnvironment === "whiteboard"}
-        <WhiteboardApp
-          shapes={whiteboardShapes}
-          comments={comments.map((comment) => ({ id: comment.id, body: comment.body, x: comment.x, y: comment.y }))}
-          selected={selected?.kind === "shape" ? { kind: "shape", id: selected.id } : null}
-          {drag}
-          {resize}
-          {drawing}
-          previewState={Boolean(previewState)}
-          onStartDrag={(event, id, x, y) => startDrag(event, "shapes", "shape", id, x, y)}
-          onStartResize={(event, id, handle, rect) => startResize(event, "shapes", "shape", id, handle, rect)}
-          onRename={(id, field, value) => void rename("shapes", id, field, value)}
-        />
-      {:else if activeEnvironment === "design"}
-        <div class="design-stage">
-          <div class="ruler horizontal"></div>
-          <div class="ruler vertical"></div>
-          {#each frames as frame (frame.id)}
-            {@const rect = draftRect("frames", frame.id, frame, { width: frame.width, height: frame.height })}
-            <article
-              data-object
-              data-testid="design-frame"
-              data-x={Math.round(rect.x)}
-              class={`design-frame ${frame.kind} ${selectedClass("frame", frame.id)}`}
-              style={`left: ${rect.x}px; top: ${rect.y}px; width: ${rect.width}px; height: ${rect.height}px; background: ${frame.color}`}
-              on:pointerdown={(event) => startDrag(event, "frames", "frame", frame.id, rect.x, rect.y)}
-            >
-              <span>{frame.kind}</span>
-              <input
-                value={frame.name}
-                disabled={Boolean(previewState)}
-                on:input={(event) => void rename("frames", frame.id, "name", event.currentTarget.value)}
-              />
-              <div class="frame-lines"></div>
-              {#if selected?.kind === "frame" && selected.id === frame.id}
-                <ResizeHandles onResizeStart={(handle, event) => startResize(event, "frames", "frame", frame.id, handle, rect)} />
-              {/if}
-            </article>
-          {/each}
-          {#if frames.length === 0}
-            <div class="empty-state">
-              <RectangleHorizontal size={26} />
-              <strong>Create a layout</strong>
-              <span>Add frames, components and asset cards, then drag them into place.</span>
-            </div>
-          {/if}
-        </div>
-      {:else}
-        <WorkflowApp
-          {nodes}
-          {edges}
-          selected={selected?.kind === "node" ? { kind: "node", id: selected.id } : null}
-          {drag}
-          {resize}
-          {linkDrag}
-          previewState={Boolean(previewState)}
-          onStartDrag={(event, id, x, y) => startDrag(event, "nodes", "node", id, x, y)}
-          onStartResize={(event, id, handle, rect) => startResize(event, "nodes", "node", id, handle, rect)}
-          onRename={(id, field, value) => void rename("nodes", id, field, value)}
-          onStartLink={(event, sourceId) => startLink(event, sourceId)}
-          onFocusLabel={(id) =>
-            room.updatePresence({
-              environment: activeEnvironment,
-              editing: `nodes.${id}.label`,
-              name: userName,
-              color: userColor
-            })}
-        />
-      {/if}
+      <div
+        class="canvas-viewport"
+        style={`transform: translate(${canvasTransform.x}px, ${canvasTransform.y}px) scale(${canvasTransform.scale})`}
+      >
+        {#if activeEnvironment === "whiteboard"}
+          <WhiteboardApp
+            shapes={whiteboardShapes}
+            comments={comments.map((comment) => ({ id: comment.id, body: comment.body, x: comment.x, y: comment.y }))}
+            selected={selected?.kind === "shape" ? { kind: "shape", id: selected.id } : null}
+            {drag}
+            {resize}
+            {drawing}
+            previewState={Boolean(previewState)}
+            onStartDrag={(event, id, x, y) => startDrag(event, "shapes", "shape", id, x, y)}
+            onStartResize={(event, id, handle, rect) => startResize(event, "shapes", "shape", id, handle, rect)}
+            onRename={(id, field, value) => void rename("shapes", id, field, value)}
+          />
+        {:else if activeEnvironment === "design"}
+          <div class="design-stage">
+            <div class="ruler horizontal"></div>
+            <div class="ruler vertical"></div>
+            {#each frames as frame (frame.id)}
+              {@const rect = draftRect("frames", frame.id, frame, { width: frame.width, height: frame.height })}
+              <article
+                data-object
+                data-testid="design-frame"
+                data-x={Math.round(rect.x)}
+                class={`design-frame ${frame.kind} ${selectedClass("frame", frame.id)}`}
+                style={`left: ${rect.x}px; top: ${rect.y}px; width: ${rect.width}px; height: ${rect.height}px; background: ${frame.color}`}
+                on:pointerdown={(event) => startDrag(event, "frames", "frame", frame.id, rect.x, rect.y)}
+              >
+                <span>{frame.kind}</span>
+                <input
+                  value={frame.name}
+                  disabled={Boolean(previewState)}
+                  on:input={(event) => void rename("frames", frame.id, "name", event.currentTarget.value)}
+                />
+                <div class="frame-lines"></div>
+                {#if selected?.kind === "frame" && selected.id === frame.id}
+                  <ResizeHandles onResizeStart={(handle, event) => startResize(event, "frames", "frame", frame.id, handle, rect)} />
+                {/if}
+              </article>
+            {/each}
+            {#if frames.length === 0}
+              <div class="empty-state">
+                <RectangleHorizontal size={26} />
+                <strong>Create a layout</strong>
+                <span>Add frames, components and asset cards, then drag them into place.</span>
+              </div>
+            {/if}
+          </div>
+        {:else}
+          <WorkflowApp
+            {nodes}
+            {edges}
+            selected={selected?.kind === "node" ? { kind: "node", id: selected.id } : null}
+            {drag}
+            {resize}
+            {linkDrag}
+            previewState={Boolean(previewState)}
+            onStartDrag={(event, id, x, y) => startDrag(event, "nodes", "node", id, x, y)}
+            onStartResize={(event, id, handle, rect) => startResize(event, "nodes", "node", id, handle, rect)}
+            onRename={(id, field, value) => void rename("nodes", id, field, value)}
+            onStartLink={(event, sourceId) => startLink(event, sourceId)}
+            onFocusLabel={(id) =>
+              room.updatePresence({
+                environment: activeEnvironment,
+                editing: `nodes.${id}.label`,
+                name: userName,
+                color: userColor
+              })}
+          />
+        {/if}
+      </div>
 
       {#each Object.entries($cursors) as [clientId, cursor] (clientId)}
         <div
@@ -900,6 +991,8 @@
           <span>{cursor.name ?? "Collaborator"}</span>
         </div>
       {/each}
+
+      <div class="zoom-badge" data-testid="zoom-badge">{Math.round(canvasTransform.scale * 100)}%</div>
     </div>
   </section>
 
