@@ -528,7 +528,8 @@ Run status is server-authoritative — only the backend can write it. Client mut
 import { createClient } from "@collab/client"
 
 const sync = createClient({
-  apiKey: "public_key",
+  serverUrl: "https://collab.your-app.example",
+  userId: "user_123",
   authToken: userToken
 })
 
@@ -650,7 +651,7 @@ sync.defineCollection("tasks", {
 
 ### Component 1: API Server
 
-Handles project creation, API keys, auth, room metadata, permissions, billing.
+Optional management surface for self-hosted deployments. Handles room metadata, app-provided auth context, permissions, health, and administration. Oculus does not require a hosted billing or API-key control plane.
 
 Tech: Bun + Hono, PostgreSQL, Drizzle ORM
 
@@ -675,8 +676,8 @@ rooms               — room registry
 room_snapshots      — periodic state snapshots
 room_events         — every mutation, partitioned by room_id
 room_members        — user membership + roles
-projects            — top-level project records
-api_keys            — hashed API keys per project
+deployments         — optional self-hosted deployment metadata
+auth_identities     — optional app-provided user identity mapping
 ```
 
 Tech: PostgreSQL for MVP, NATS JetStream for high-throughput event streaming at scale.
@@ -1945,45 +1946,18 @@ This is a specific wedge. These are all products where collaboration is a featur
 
 ---
 
-## 18. Pricing model
+## 18. Open-source self-hosting model
 
-```
-Free tier
-─────────────────────────────────────────
-3 projects
-100 rooms
-1,000 monthly active users
-7-day event history
-Community support
+Oculus is free, open-source, and self-hosted. The core project should focus on:
 
-Pro — $49/month
-─────────────────────────────────────────
-Unlimited projects
-10,000 rooms
-50,000 monthly active users
-30-day replay timeline
-Advanced permissions (field-level)
-Email support
+- Docker-first local and production deployments
+- Postgres-backed durability
+- Optional Redis/NATS infrastructure for larger installations
+- Bring-your-own auth and role context
+- Migration, backup, restore, and observability docs
+- Community support and clear extension points
 
-Team — $199/month
-─────────────────────────────────────────
-Everything in Pro
-Audit logs
-90-day history
-Private projects
-Priority scaling
-Webhook integrations
-Slack support
-
-Enterprise — custom
-─────────────────────────────────────────
-Self-hosting option
-SSO (SAML/OIDC)
-Compliance (SOC2, GDPR)
-Dedicated infrastructure
-SLA guarantees
-Custom event retention
-```
+Hosted accounts, paid tiers, billing, and Oculus-issued API keys are out of scope for the core project. Apps built on Oculus may add their own product-specific auth, tenancy, and billing outside the engine.
 
 ---
 
@@ -1999,32 +1973,42 @@ Add Postgres, room snapshots, event persistence, and reconnect state recovery.
 
 **Goal:** Reload room and preserve full state.
 
-### Phase 3 — SDK
-Build `@collab/client` and `@collab/react`.
+### Phase 3 — Universal SDK
+Build `@oculus/sdk`, framework wrappers, and a universal operation model for objects, fields, text, ordered lists, locks, and tombstones.
 
 **Goal:** External developer can integrate it in their own app.
 
-### Phase 4 — Replay
+### Phase 4 — CRDT text and mixed conflict strategies
+Add Yjs-backed `crdt-text`, field-level strategies, ordered list/tree operations, and custom resolvers.
+
+**Goal:** Support documents, node editors, whiteboards, and Figma-like design tools from the same engine.
+
+### Phase 5 — Replay
 Build event timeline, state replay, session playback, diff view between two versions.
 
 **Goal:** Make debugging and history a product differentiator. Make the replay UI so useful that developers use it as their primary debugging tool.
 
-### Phase 4.5 — Webhooks + integrations
+### Phase 5.5 — Webhooks + integrations
 Add webhook subscriptions for room events: `node.created`, `room.empty`, `session.ended`. Let developers connect their rooms to Zapier, Slack, and other tools.
 
 **Goal:** Make the platform composable with other products.
 
-### Phase 5 — Permissions
+### Phase 6 — Permissions
 Add room roles (viewer, editor, admin), field-level permission rules, server-side enforcement.
 
 **Goal:** Make it usable in real production apps with real user roles.
 
-### Phase 6 — Offline support
+### Phase 7 — Offline support
 Add local operation queue, reconnect merge, conflict handling for queued ops, version reconciliation.
 
 **Goal:** Make it resilient for mobile and poor-connection users.
 
-### Phase 7 — Multi-region
+### Phase 8 — Self-hosted scale-out
+Add production Docker Compose guidance, migrations, backups, readiness checks, Redis/NATS fan-out, and operational docs.
+
+**Goal:** Make Oculus straightforward to run and operate outside a hosted control plane.
+
+### Phase 9 — Multi-region
 Add vector clocks or hybrid logical clocks, active/active multi-region rooms, region-aware event storage.
 
 **Goal:** Sub-100ms latency for users on any continent.

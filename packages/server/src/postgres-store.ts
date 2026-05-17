@@ -20,6 +20,10 @@ type RoomRow = {
   initial_state: Record<string, unknown>;
 };
 
+type CrdtStateRow = {
+  states: Record<string, number[]>;
+};
+
 export async function migratePostgresEventStore(sql: Sql): Promise<void> {
   await sql`
     create table if not exists rooms (
@@ -56,6 +60,16 @@ export async function migratePostgresEventStore(sql: Sql): Promise<void> {
   `;
 
   await sql`
+    create table if not exists room_crdt_text_states (
+      room_id text not null references rooms(id) on delete cascade,
+      version integer not null,
+      states jsonb not null,
+      created_at timestamptz not null default now(),
+      primary key (room_id, version)
+    )
+  `;
+
+  await sql`
     create index if not exists room_events_room_version_idx
     on room_events (room_id, version)
   `;
@@ -63,6 +77,11 @@ export async function migratePostgresEventStore(sql: Sql): Promise<void> {
   await sql`
     create index if not exists room_snapshots_room_version_desc_idx
     on room_snapshots (room_id, version desc)
+  `;
+
+  await sql`
+    create index if not exists room_crdt_text_states_room_version_desc_idx
+    on room_crdt_text_states (room_id, version desc)
   `;
 }
 
@@ -156,6 +175,32 @@ export class PostgresEventStore implements EventStore {
       values (${roomId}, ${version}, ${this.json(state)})
       on conflict (room_id, version)
       do update set state = excluded.state, created_at = now()
+    `;
+  }
+
+  async getCrdtTextStates(
+    roomId: string,
+    atOrBeforeVersion = Number.POSITIVE_INFINITY
+  ): Promise<Map<string, number[]>> {
+    const rows = await this.sql<CrdtStateRow[]>`
+      select states
+      from room_crdt_text_states
+      where room_id = ${roomId}
+        and version <= ${finiteVersion(atOrBeforeVersion)}
+      order by version desc
+      limit 1
+    `;
+    return new Map(
+      Object.entries(rows[0]?.states ?? {}).map(([path, state]) => [path, [...state]])
+    );
+  }
+
+  async saveCrdtTextStates(roomId: string, version: number, states: Map<string, number[]>): Promise<void> {
+    await this.sql`
+      insert into room_crdt_text_states (room_id, version, states)
+      values (${roomId}, ${version}, ${this.json(Object.fromEntries(states))})
+      on conflict (room_id, version)
+      do update set states = excluded.states, created_at = now()
     `;
   }
 

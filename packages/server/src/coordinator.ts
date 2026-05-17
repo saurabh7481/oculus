@@ -1,8 +1,72 @@
-export type Operation = {
-  op: "insert" | "update" | "delete";
-  path: string;
-  value?: unknown;
+import {
+  applyCrdtTextOperation,
+  encodeCrdtTextState
+} from "./crdt";
+
+export type TextOperationValue = {
+  index?: number;
+  insert?: string;
+  delete?: number;
+  yjsUpdate?: number[];
 };
+
+export type ListMoveOperationValue = {
+  from: number;
+  to: number;
+};
+
+export type LockOperationValue = {
+  owner: string | null;
+};
+
+export type TombstoneDeleteOperationValue = {
+  deletedBy?: string;
+  deletedAt?: number;
+};
+
+export type TreeMoveOperationValue = {
+  id: string;
+  fromParentId: string | null;
+  toParentId: string | null;
+  toIndex?: number;
+};
+
+export type Operation =
+  | {
+      op: "insert" | "update" | "set";
+      path: string;
+      value: unknown;
+    }
+  | {
+      op: "delete";
+      path: string;
+      value?: unknown;
+    }
+  | {
+      op: "text";
+      path: string;
+      value: TextOperationValue;
+    }
+  | {
+      op: "list-move";
+      path: string;
+      value: ListMoveOperationValue;
+    }
+  | {
+      op: "lock";
+      path: string;
+      value: LockOperationValue;
+    }
+  | {
+      op: "tombstone-delete";
+      path: string;
+      value?: TombstoneDeleteOperationValue;
+    }
+  | {
+      op: "tree-move";
+      path: string;
+      value: TreeMoveOperationValue;
+    };
 
 export type ConflictMeta = {
   roomId: string;
@@ -42,6 +106,7 @@ type RoomCacheEntry = {
   version: number;
   state: Record<string, unknown>;
   initialState: Record<string, unknown>;
+  crdtTextStates: Map<string, number[]>;
   connectedClients: Map<string, { userId: string; presence: Record<string, unknown> }>;
   lastAccess: number;
 };
@@ -56,12 +121,15 @@ export interface EventStore {
     atOrBeforeVersion?: number
   ): Promise<{ version: number; state: Record<string, unknown> } | undefined>;
   saveSnapshot(roomId: string, version: number, state: Record<string, unknown>): Promise<void>;
+  getCrdtTextStates(roomId: string, atOrBeforeVersion?: number): Promise<Map<string, number[]>>;
+  saveCrdtTextStates(roomId: string, version: number, states: Map<string, number[]>): Promise<void>;
 }
 
 export class MemoryEventStore implements EventStore {
   private initialStates = new Map<string, Record<string, unknown>>();
   private events = new Map<string, RoomEvent[]>();
   private snapshots = new Map<string, Array<{ version: number; state: Record<string, unknown> }>>();
+  private crdtTextStates = new Map<string, Array<{ version: number; states: Map<string, number[]> }>>();
 
   async loadInitialState(roomId: string): Promise<Record<string, unknown> | undefined> {
     const state = this.initialStates.get(roomId);
@@ -105,6 +173,22 @@ export class MemoryEventStore implements EventStore {
     snapshots.push({ version, state: clone(state) });
     this.snapshots.set(roomId, snapshots);
   }
+
+  async getCrdtTextStates(
+    roomId: string,
+    atOrBeforeVersion = Number.POSITIVE_INFINITY
+  ): Promise<Map<string, number[]>> {
+    const snapshot = (this.crdtTextStates.get(roomId) ?? [])
+      .filter((candidate) => candidate.version <= atOrBeforeVersion)
+      .sort((a, b) => b.version - a.version)[0];
+    return snapshot ? cloneCrdtTextStates(snapshot.states) : new Map();
+  }
+
+  async saveCrdtTextStates(roomId: string, version: number, states: Map<string, number[]>): Promise<void> {
+    const snapshots = this.crdtTextStates.get(roomId) ?? [];
+    snapshots.push({ version, states: cloneCrdtTextStates(states) });
+    this.crdtTextStates.set(roomId, snapshots);
+  }
 }
 
 export class RoomCoordinator {
@@ -139,6 +223,7 @@ export class RoomCoordinator {
     const snapshot = await this.store.getLatestSnapshot(roomId);
     let version = snapshot?.version ?? 0;
     let state = snapshot ? clone(snapshot.state) : clone(initialState);
+    const crdtTextStates = await this.store.getCrdtTextStates(roomId, version);
     for (const event of await this.store.getEvents(roomId, version)) {
       state = this.applyOperations(state, event.operations, {
         roomId,
@@ -146,7 +231,7 @@ export class RoomCoordinator {
         incomingVersion: event.version - 1,
         userId: event.userId,
         timestamp: event.timestamp
-      });
+      }, crdtTextStates);
       version = event.version;
     }
 
@@ -154,6 +239,7 @@ export class RoomCoordinator {
       version,
       state,
       initialState,
+      crdtTextStates,
       connectedClients: new Map(),
       lastAccess: Date.now()
     });
@@ -209,13 +295,14 @@ export class RoomCoordinator {
     const serverVersion = room.version + 1;
     const timestamp = Date.now();
 
+    const nextCrdtTextStates = cloneCrdtTextStates(room.crdtTextStates);
     const nextState = this.applyOperations(room.state, transformedOperations, {
       roomId: params.roomId,
       currentVersion: room.version,
       incomingVersion: params.baseVersion,
       userId: params.userId,
       timestamp
-    });
+    }, nextCrdtTextStates);
 
     try {
       await this.store.appendEvent({
@@ -233,10 +320,11 @@ export class RoomCoordinator {
 
     room.version = serverVersion;
     room.state = nextState;
+    room.crdtTextStates = nextCrdtTextStates;
     room.lastAccess = timestamp;
 
     if (serverVersion % 100 === 0) {
-      void this.store.saveSnapshot(params.roomId, serverVersion, nextState);
+      void this.saveRoomSnapshot(params.roomId, serverVersion, nextState, nextCrdtTextStates);
     }
 
     return {
@@ -304,7 +392,7 @@ export class RoomCoordinator {
 
     room.connectedClients.delete(clientId);
     if (room.connectedClients.size === 0) {
-      await this.store.saveSnapshot(roomId, room.version, room.state);
+      await this.saveRoomSnapshot(roomId, room.version, room.state, room.crdtTextStates);
     }
   }
 
@@ -325,6 +413,7 @@ export class RoomCoordinator {
       room?.initialState ?? (await this.store.loadInitialState(roomId)) ?? {};
     const snapshot = await this.store.getLatestSnapshot(roomId, version);
     let state = snapshot ? clone(snapshot.state) : clone(initialState);
+    const crdtTextStates = await this.store.getCrdtTextStates(roomId, snapshot?.version ?? 0);
 
     for (const event of await this.store.getEvents(roomId, snapshot?.version ?? 0)) {
       if (event.version > version) break;
@@ -334,7 +423,7 @@ export class RoomCoordinator {
         incomingVersion: event.version - 1,
         userId: event.userId,
         timestamp: event.timestamp
-      });
+      }, crdtTextStates);
     }
 
     return state;
@@ -351,10 +440,11 @@ export class RoomCoordinator {
   private applyOperations(
     state: Record<string, unknown>,
     operations: Operation[],
-    meta: ConflictMeta
+    meta: ConflictMeta,
+    crdtTextStates = new Map<string, number[]>()
   ): Record<string, unknown> {
     return operations.reduce(
-      (nextState, operation) => this.applyOperation(nextState, operation, meta),
+      (nextState, operation) => this.applyOperation(nextState, operation, meta, crdtTextStates),
       clone(state)
     );
   }
@@ -362,17 +452,65 @@ export class RoomCoordinator {
   private applyOperation(
     state: Record<string, unknown>,
     operation: Operation,
-    meta: ConflictMeta
+    meta: ConflictMeta,
+    crdtTextStates: Map<string, number[]>
   ): Record<string, unknown> {
+    if (operation.op !== "delete" && operation.op !== "tombstone-delete" && hasTombstoneAncestor(state, operation.path)) {
+      return state;
+    }
+
     if (operation.op === "delete") {
       return deletePath(state, operation.path);
     }
 
-    if (operation.op === "insert") {
-      return setPath(state, operation.path, operation.value);
+    if (operation.op === "tombstone-delete") {
+      return setPath(state, operation.path, applyTombstoneDelete(getPath(state, operation.path), operation.value));
+    }
+
+    if (operation.op === "text") {
+      const strategy = this.getFieldStrategy(operation.path);
+      if (strategy?.strategy === "crdt-text") {
+        const result = applyCrdtTextOperation(
+          getPath(state, operation.path),
+          operation.value,
+          crdtTextStates.get(operation.path)
+        );
+        crdtTextStates.set(operation.path, result.encodedState);
+        return setPath(state, operation.path, result.text);
+      }
+
+      return setPath(
+        state,
+        operation.path,
+        applyTextOperation(getPath(state, operation.path), operation.value)
+      );
+    }
+
+    if (operation.op === "list-move") {
+      return setPath(
+        state,
+        operation.path,
+        applyListMoveOperation(getPath(state, operation.path), operation.value)
+      );
+    }
+
+    if (operation.op === "lock") {
+      return setPath(state, operation.path, operation.value.owner);
+    }
+
+    if (operation.op === "tree-move") {
+      return setPath(
+        state,
+        operation.path,
+        applyTreeMoveOperation(getPath(state, operation.path), operation.value)
+      );
     }
 
     const strategy = this.getFieldStrategy(operation.path);
+    if (strategy?.strategy === "crdt-text") {
+      crdtTextStates.set(operation.path, encodeCrdtTextState(operation.value));
+    }
+
     if (strategy?.strategy === "custom") {
       const current = getPath(state, operation.path);
       return setPath(state, operation.path, strategy.resolver(current, operation.value, meta));
@@ -385,6 +523,16 @@ export class RoomCoordinator {
     const [collection, , field] = path.split(".");
     if (!collection || !field) return undefined;
     return this.collectionConfigs.get(collection)?.fields?.[field];
+  }
+
+  private async saveRoomSnapshot(
+    roomId: string,
+    version: number,
+    state: Record<string, unknown>,
+    crdtTextStates: Map<string, number[]>
+  ): Promise<void> {
+    await this.store.saveSnapshot(roomId, version, state);
+    await this.store.saveCrdtTextStates(roomId, version, crdtTextStates);
   }
 }
 
@@ -433,6 +581,93 @@ export function deletePath(obj: Record<string, unknown>, path: string): Record<s
   return next;
 }
 
+function applyTextOperation(current: unknown, value: TextOperationValue): string {
+  if (value.yjsUpdate) return typeof current === "string" ? current : "";
+  const text = typeof current === "string" ? current : "";
+  const index = clampInteger(value.index ?? text.length, 0, text.length);
+  const deleteCount = clampInteger(value.delete ?? 0, 0, text.length - index);
+  return `${text.slice(0, index)}${value.insert ?? ""}${text.slice(index + deleteCount)}`;
+}
+
+function applyTombstoneDelete(current: unknown, value: TombstoneDeleteOperationValue = {}): Record<string, unknown> {
+  const object = typeof current === "object" && current !== null ? current as Record<string, unknown> : {};
+  return {
+    ...object,
+    __deleted: true,
+    __deletedAt: value.deletedAt ?? Date.now(),
+    __deletedBy: value.deletedBy
+  };
+}
+
+function applyListMoveOperation(current: unknown, value: ListMoveOperationValue): unknown[] {
+  if (!Array.isArray(current) || current.length === 0) return Array.isArray(current) ? [...current] : [];
+  const next = [...current];
+  const from = clampInteger(value.from, 0, next.length - 1);
+  const [item] = next.splice(from, 1);
+  const to = clampInteger(value.to, 0, next.length);
+  next.splice(to, 0, item);
+  return next;
+}
+
+function applyTreeMoveOperation(current: unknown, value: TreeMoveOperationValue): Record<string, unknown> {
+  if (typeof current !== "object" || current === null) return {};
+  const tree = clone(current as Record<string, unknown>);
+  const node = asTreeNode(tree[value.id]);
+  if (!node) return tree;
+
+  if (value.fromParentId && asTreeNode(tree[value.fromParentId])) {
+    const fromParent = asTreeNode(tree[value.fromParentId])!;
+    fromParent.children = fromParent.children.filter((childId) => childId !== value.id);
+    tree[value.fromParentId] = fromParent;
+  }
+
+  if (value.toParentId && asTreeNode(tree[value.toParentId])) {
+    const toParent = asTreeNode(tree[value.toParentId])!;
+    const withoutExisting = toParent.children.filter((childId) => childId !== value.id);
+    const toIndex = clampInteger(value.toIndex ?? withoutExisting.length, 0, withoutExisting.length);
+    withoutExisting.splice(toIndex, 0, value.id);
+    toParent.children = withoutExisting;
+    tree[value.toParentId] = toParent;
+  }
+
+  node.parentId = value.toParentId;
+  tree[value.id] = node;
+  return tree;
+}
+
+function asTreeNode(value: unknown): (Record<string, unknown> & { children: string[] }) | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const node = value as Record<string, unknown> & { children?: unknown };
+  return {
+    ...node,
+    children: Array.isArray(node.children) ? node.children.filter((child): child is string => typeof child === "string") : []
+  };
+}
+
+function hasTombstoneAncestor(obj: Record<string, unknown>, path: string): boolean {
+  const keys = path.split(".");
+  for (let index = keys.length - 1; index > 0; index--) {
+    const candidate = getPath(obj, keys.slice(0, index).join("."));
+    if (
+      typeof candidate === "object" &&
+      candidate !== null &&
+      (candidate as Record<string, unknown>).__deleted === true
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function clampInteger(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(Math.trunc(value), min), max);
+}
+
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function cloneCrdtTextStates(states: Map<string, number[]>): Map<string, number[]> {
+  return new Map([...states.entries()].map(([path, state]) => [path, [...state]]));
 }

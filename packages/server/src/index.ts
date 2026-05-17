@@ -30,7 +30,7 @@ coordinator.defineCollection("nodes", {
   fields: {
     x: { strategy: "lww" },
     y: { strategy: "lww" },
-    label: { strategy: "lww" },
+    label: { strategy: "crdt-text" },
     lockedBy: {
       strategy: "custom",
       resolver: (current, incoming, meta) => {

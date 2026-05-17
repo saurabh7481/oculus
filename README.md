@@ -1,6 +1,6 @@
 # Oculus
 
-Oculus is a standalone TypeScript SDK and realtime room server for building multiuser, sync-enabled applications without recreating collaboration infrastructure from scratch.
+Oculus is a free, open-source, self-hosted TypeScript SDK and realtime room server for building multiuser, sync-enabled applications without recreating collaboration infrastructure from scratch.
 
 The initial implementation includes:
 

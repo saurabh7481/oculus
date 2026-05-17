@@ -1,9 +1,98 @@
 import type { z } from "zod";
 
-export type Operation = {
-  op: "insert" | "update" | "delete";
-  path: string;
-  value?: unknown;
+export type TextOperationValue = {
+  index?: number;
+  insert?: string;
+  delete?: number;
+  yjsUpdate?: number[];
+};
+
+export type ListMoveOperationValue = {
+  from: number;
+  to: number;
+};
+
+export type LockOperationValue = {
+  owner: string | null;
+};
+
+export type TombstoneDeleteOperationValue = {
+  deletedBy?: string;
+  deletedAt?: number;
+};
+
+export type TreeMoveOperationValue = {
+  id: string;
+  fromParentId: string | null;
+  toParentId: string | null;
+  toIndex?: number;
+};
+
+export type Operation =
+  | {
+      op: "insert" | "update" | "set";
+      path: string;
+      value: unknown;
+    }
+  | {
+      op: "delete";
+      path: string;
+      value?: unknown;
+    }
+  | {
+      op: "text";
+      path: string;
+      value: TextOperationValue;
+    }
+  | {
+      op: "list-move";
+      path: string;
+      value: ListMoveOperationValue;
+    }
+  | {
+      op: "lock";
+      path: string;
+      value: LockOperationValue;
+    }
+  | {
+      op: "tombstone-delete";
+      path: string;
+      value?: TombstoneDeleteOperationValue;
+    }
+  | {
+      op: "tree-move";
+      path: string;
+      value: TreeMoveOperationValue;
+    };
+
+type CollectionOperation = "insert" | "update" | "delete";
+
+export type StringFieldName<T> = Extract<
+  {
+    [K in keyof T]-?: NonNullable<T[K]> extends string ? K : never;
+  }[keyof T],
+  string
+>;
+
+export type FieldName<T> = Extract<keyof T, string>;
+
+export type RemoveOptions = {
+  preserveHistory?: boolean;
+  deletedBy?: string;
+  deletedAt?: number;
+};
+
+export type TreeMoveOptions = {
+  from: string | null;
+  to: string | null;
+  at?: number;
+};
+
+type RoomMutationApi = {
+  apply(operations: Operation[]): Promise<unknown>;
+  presence: {
+    lock(path: string): Promise<{ acquired: boolean; release: () => Promise<unknown> }>;
+  };
 };
 
 export type RoomEvent = {
@@ -110,6 +199,22 @@ export class OculusRoom<S = Record<string, unknown>> {
     private readonly roomOptions?: RoomOptions<S>
   ) {}
 
+  collection<T extends Record<string, unknown> = Record<string, unknown>>(name: string): OculusCollection<T> {
+    return new OculusCollection(this, name, () => this.clientOptions.userId ?? this.clientId);
+  }
+
+  items<T extends Record<string, unknown> = Record<string, unknown>>(name: string): OculusCollection<T> {
+    return this.collection<T>(name);
+  }
+
+  list(path: string): OculusList {
+    return new OculusList(this, path);
+  }
+
+  tree(path: string): OculusTree {
+    return new OculusTree(this, path);
+  }
+
   readonly stateApi = {
     collection: (name: string) => ({
       insert: (id: string, data: Record<string, unknown>) =>
@@ -141,13 +246,17 @@ export class OculusRoom<S = Record<string, unknown>> {
     },
     onChange: (handler: Handler) => this.on("presence_change", handler),
     lock: async (path: string) => {
-      await this.mutate([{ op: "update", path, value: this.clientOptions.userId ?? this.clientId }]);
+      await this.mutate([{ op: "lock", path, value: { owner: this.clientOptions.userId ?? this.clientId } }]);
       return {
         acquired: true,
-        release: () => this.mutate([{ op: "update", path, value: null }])
+        release: () => this.mutate([{ op: "lock", path, value: { owner: null } }])
       };
     }
   };
+
+  async apply(operations: Operation[]): Promise<unknown> {
+    return this.mutate(operations);
+  }
 
   async connect(): Promise<void> {
     if (this.connected) return;
@@ -337,20 +446,135 @@ export class OculusRoom<S = Record<string, unknown>> {
   }
 }
 
+export class OculusCollection<T extends Record<string, unknown> = Record<string, unknown>> {
+  constructor(
+    private readonly room: RoomMutationApi,
+    private readonly name: string,
+    private readonly getActorId: () => string
+  ) {}
+
+  create(id: string, data: T): Promise<unknown> {
+    return this.room.apply(createCollectionOperations(this.name, id, "insert", data));
+  }
+
+  change(id: string, data: Partial<T>): Promise<unknown> {
+    return this.room.apply(createCollectionOperations(this.name, id, "update", data));
+  }
+
+  remove(id: string, options: RemoveOptions = {}): Promise<unknown> {
+    if (options.preserveHistory) {
+      return this.room.apply([
+        createTombstoneDeleteOperation(this.pathFor(id), {
+          deletedAt: options.deletedAt,
+          deletedBy: options.deletedBy ?? this.getActorId()
+        })
+      ]);
+    }
+
+    return this.room.apply(createCollectionOperations(this.name, id, "delete"));
+  }
+
+  text(fieldId: string, field: StringFieldName<T>): OculusTextField {
+    return new OculusTextField(this.room, this.pathFor(fieldId, field));
+  }
+
+  lock(fieldId: string, field: FieldName<T>): Promise<{ acquired: boolean; release: () => Promise<unknown> }> {
+    return this.room.presence.lock(this.pathFor(fieldId, field));
+  }
+
+  private pathFor(id: string, field?: string): string {
+    return [this.name, id, field].filter(Boolean).join(".");
+  }
+}
+
+export class OculusTextField {
+  constructor(
+    private readonly room: Pick<RoomMutationApi, "apply">,
+    private readonly path: string
+  ) {}
+
+  insert(index: number, text: string): Promise<unknown> {
+    return this.room.apply([createTextOperation(this.path, { index, insert: text })]);
+  }
+
+  delete(index: number, count: number): Promise<unknown> {
+    return this.room.apply([createTextOperation(this.path, { index, delete: count })]);
+  }
+
+  replace(text: string): Promise<unknown> {
+    return this.room.apply([{ op: "set", path: this.path, value: text }]);
+  }
+
+  applyYjsUpdate(update: Uint8Array | number[]): Promise<unknown> {
+    return this.room.apply([createYjsTextOperation(this.path, Array.from(update))]);
+  }
+}
+
+export class OculusList {
+  constructor(
+    private readonly room: Pick<RoomMutationApi, "apply">,
+    private readonly path: string
+  ) {}
+
+  move(from: number, to: number): Promise<unknown> {
+    return this.room.apply([createListMoveOperation(this.path, from, to)]);
+  }
+}
+
+export class OculusTree {
+  constructor(
+    private readonly room: Pick<RoomMutationApi, "apply">,
+    private readonly path: string
+  ) {}
+
+  move(id: string, options: TreeMoveOptions): Promise<unknown> {
+    return this.room.apply([createTreeMoveOperation(this.path, id, options.from, options.to, options.at)]);
+  }
+}
+
 export function createCollectionOperations(
   collection: string,
   id: string,
-  op: Operation["op"],
+  op: CollectionOperation,
   data?: Record<string, unknown>
 ): Operation[] {
   if (op === "delete") return [{ op: "delete", path: `${collection}.${id}` }];
-  if (op === "insert") return [{ op: "insert", path: `${collection}.${id}`, value: data ?? {} }];
+  if (op === "insert") return [{ op: "set", path: `${collection}.${id}`, value: data ?? {} }];
 
   return Object.entries(data ?? {}).map(([field, value]) => ({
-    op: "update",
+    op: "set",
     path: `${collection}.${id}.${field}`,
     value
   }));
+}
+
+export function createTextOperation(path: string, value: TextOperationValue): Operation {
+  return { op: "text", path, value };
+}
+
+export function createYjsTextOperation(path: string, yjsUpdate: number[]): Operation {
+  return { op: "text", path, value: { yjsUpdate } };
+}
+
+export function createListMoveOperation(path: string, from: number, to: number): Operation {
+  return { op: "list-move", path, value: { from, to } };
+}
+
+export function createTreeMoveOperation(
+  path: string,
+  id: string,
+  fromParentId: string | null,
+  toParentId: string | null,
+  toIndex?: number
+): Operation {
+  return { op: "tree-move", path, value: { id, fromParentId, toParentId, toIndex } };
+}
+
+export function createTombstoneDeleteOperation(
+  path: string,
+  value: TombstoneDeleteOperationValue = {}
+): Operation {
+  return { op: "tombstone-delete", path, value };
 }
 
 export function applyOperations<S extends Record<string, unknown>>(
@@ -358,9 +582,37 @@ export function applyOperations<S extends Record<string, unknown>>(
   operations: Operation[]
 ): S {
   return operations.reduce((next, operation) => {
+    if (operation.op !== "delete" && operation.op !== "tombstone-delete" && hasTombstoneAncestor(next, operation.path)) {
+      return next;
+    }
     if (operation.op === "delete") return deletePath(next, operation.path) as S;
+    if (operation.op === "tombstone-delete") {
+      return setPath(next, operation.path, applyTombstoneDelete(getPath(next, operation.path), operation.value)) as S;
+    }
+    if (operation.op === "text") {
+      const current = getPath(next, operation.path);
+      return setPath(next, operation.path, applyTextOperation(current, operation.value)) as S;
+    }
+    if (operation.op === "list-move") {
+      const current = getPath(next, operation.path);
+      return setPath(next, operation.path, applyListMoveOperation(current, operation.value)) as S;
+    }
+    if (operation.op === "lock") {
+      return setPath(next, operation.path, operation.value.owner) as S;
+    }
+    if (operation.op === "tree-move") {
+      const current = getPath(next, operation.path);
+      return setPath(next, operation.path, applyTreeMoveOperation(current, operation.value)) as S;
+    }
     return setPath(next, operation.path, operation.value) as S;
   }, clone(state));
+}
+
+function getPath(obj: Record<string, unknown>, path: string): unknown {
+  return path.split(".").reduce<unknown>((acc, key) => {
+    if (typeof acc !== "object" || acc === null) return undefined;
+    return (acc as Record<string, unknown>)[key];
+  }, obj);
 }
 
 function setPath(obj: Record<string, unknown>, path: string, value: unknown): Record<string, unknown> {
@@ -392,6 +644,89 @@ function deletePath(obj: Record<string, unknown>, path: string): Record<string, 
 
   if (cursor) delete cursor[keys[keys.length - 1] ?? ""];
   return next;
+}
+
+function applyTextOperation(current: unknown, value: TextOperationValue): string {
+  if (value.yjsUpdate) return typeof current === "string" ? current : "";
+  const text = typeof current === "string" ? current : "";
+  const index = clampInteger(value.index ?? text.length, 0, text.length);
+  const deleteCount = clampInteger(value.delete ?? 0, 0, text.length - index);
+  return `${text.slice(0, index)}${value.insert ?? ""}${text.slice(index + deleteCount)}`;
+}
+
+function applyTombstoneDelete(current: unknown, value: TombstoneDeleteOperationValue = {}): Record<string, unknown> {
+  const object = typeof current === "object" && current !== null ? current as Record<string, unknown> : {};
+  return {
+    ...object,
+    __deleted: true,
+    __deletedAt: value.deletedAt ?? Date.now(),
+    __deletedBy: value.deletedBy
+  };
+}
+
+function applyTreeMoveOperation(current: unknown, value: TreeMoveOperationValue): Record<string, unknown> {
+  if (typeof current !== "object" || current === null) return {};
+  const tree = clone(current as Record<string, unknown>);
+  const node = asTreeNode(tree[value.id]);
+  if (!node) return tree;
+
+  if (value.fromParentId && asTreeNode(tree[value.fromParentId])) {
+    const fromParent = asTreeNode(tree[value.fromParentId])!;
+    fromParent.children = fromParent.children.filter((childId) => childId !== value.id);
+    tree[value.fromParentId] = fromParent;
+  }
+
+  if (value.toParentId && asTreeNode(tree[value.toParentId])) {
+    const toParent = asTreeNode(tree[value.toParentId])!;
+    const withoutExisting = toParent.children.filter((childId) => childId !== value.id);
+    const toIndex = clampInteger(value.toIndex ?? withoutExisting.length, 0, withoutExisting.length);
+    withoutExisting.splice(toIndex, 0, value.id);
+    toParent.children = withoutExisting;
+    tree[value.toParentId] = toParent;
+  }
+
+  node.parentId = value.toParentId;
+  tree[value.id] = node;
+  return tree;
+}
+
+function asTreeNode(value: unknown): (Record<string, unknown> & { children: string[] }) | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const node = value as Record<string, unknown> & { children?: unknown };
+  return {
+    ...node,
+    children: Array.isArray(node.children) ? node.children.filter((child): child is string => typeof child === "string") : []
+  };
+}
+
+function hasTombstoneAncestor(obj: Record<string, unknown>, path: string): boolean {
+  const keys = path.split(".");
+  for (let index = keys.length - 1; index > 0; index--) {
+    const candidate = getPath(obj, keys.slice(0, index).join("."));
+    if (
+      typeof candidate === "object" &&
+      candidate !== null &&
+      (candidate as Record<string, unknown>).__deleted === true
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function applyListMoveOperation(current: unknown, value: ListMoveOperationValue): unknown[] {
+  if (!Array.isArray(current) || current.length === 0) return Array.isArray(current) ? [...current] : [];
+  const next = [...current];
+  const from = clampInteger(value.from, 0, next.length - 1);
+  const [item] = next.splice(from, 1);
+  const to = clampInteger(value.to, 0, next.length);
+  next.splice(to, 0, item);
+  return next;
+}
+
+function clampInteger(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(Math.trunc(value), min), max);
 }
 
 function getOrCreateClientId(): string {

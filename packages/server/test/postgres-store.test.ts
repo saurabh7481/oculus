@@ -51,6 +51,16 @@ describe.skipIf(!testUrl)("PostgresEventStore", () => {
           node_1: { id: "node_1", x: 40, y: 20, label: "Start" }
         }
       });
+      await store.saveCrdtTextStates(
+        roomId,
+        1,
+        new Map([["nodes.node_1.label", [1, 2, 3]]])
+      );
+      await store.saveCrdtTextStates(
+        roomId,
+        2,
+        new Map([["nodes.node_1.label", [4, 5, 6]]])
+      );
 
       expect(await store.loadInitialState(roomId)).toEqual({ nodes: {} });
       expect(await store.getEvents(roomId, 1)).toMatchObject([
@@ -79,7 +89,14 @@ describe.skipIf(!testUrl)("PostgresEventStore", () => {
           }
         }
       });
+      expect(await store.getCrdtTextStates(roomId, 1)).toEqual(
+        new Map([["nodes.node_1.label", [1, 2, 3]]])
+      );
+      expect(await store.getCrdtTextStates(roomId)).toEqual(
+        new Map([["nodes.node_1.label", [4, 5, 6]]])
+      );
     } finally {
+      await sql`delete from room_crdt_text_states where room_id = ${roomId}`;
       await sql`delete from room_snapshots where room_id = ${roomId}`;
       await sql`delete from room_events where room_id = ${roomId}`;
       await sql`delete from rooms where id = ${roomId}`;
