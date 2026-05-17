@@ -38,6 +38,7 @@
     zoomTransform,
     type CanvasTransform
   } from "../canvas/useCanvasTransform";
+  import ColorPicker from "../ui/color-picker/ColorPicker.svelte";
   import Dialog from "../ui/dialog/Dialog.svelte";
   import WhiteboardApp from "../whiteboard/WhiteboardApp.svelte";
   import WhiteboardToolbar from "../whiteboard/WhiteboardToolbar.svelte";
@@ -708,6 +709,15 @@
     await room.update(collection, id, { [field]: value });
   }
 
+  async function recolor(color: string) {
+    if (!selected || selected.kind !== "shape") return;
+    await room.transaction(
+      "Recolor shape",
+      [{ op: "set", path: `shapes.${selected.id}.color`, value: color }],
+      { kind: "whiteboard", targetIds: [selected.id] }
+    );
+  }
+
   async function showReplay(targetVersion: number) {
     try {
       previewVersion = targetVersion;
@@ -1038,6 +1048,16 @@
     </button>
 
     {#if !inspectorCollapsed}
+      {#if selected?.kind === "shape" && visibleState.shapes?.[selected.id]}
+        <section>
+          <p class="eyebrow">Object color</p>
+          <ColorPicker
+            value={visibleState.shapes[selected.id].color}
+            onchange={(color) => void recolor(color)}
+          />
+        </section>
+      {/if}
+
       <section>
         <p class="eyebrow">Live room</p>
         <div class="metrics-grid">
