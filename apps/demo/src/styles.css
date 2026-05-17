@@ -814,22 +814,36 @@ button:not(:disabled):hover {
   padding: 12px 34px 12px 12px;
   display: flex;
   align-items: center;
-  gap: 9px;
   border: 2px solid #2563eb;
   border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 16px 36px rgb(15 23 42 / 12%);
 }
 
-.workflow-node.decision {
-  border-radius: 18px;
+.workflow-node.trigger {
+  border-radius: 9999px;
 }
 
-.node-dot {
-  width: 11px;
-  height: 11px;
-  flex: 0 0 auto;
-  border-radius: 999px;
+.workflow-node.decision {
+  transform: rotate(45deg);
+  border-radius: 6px;
+}
+
+.workflow-node.decision .node-content {
+  transform: rotate(-45deg);
+}
+
+.node-content {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+}
+
+.node-icon {
+  flex-shrink: 0;
+  opacity: 0.7;
+  color: inherit;
 }
 
 .connect-handle {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Link2 } from "lucide-svelte";
+  import { Link2, Zap, Play, GitBranch } from "lucide-svelte";
   import ResizeHandles from "../canvas/ResizeHandles.svelte";
   import type { Rect } from "../canvas/geometry";
   import type { ResizeHandle } from "../canvas/useResize";
@@ -39,22 +39,32 @@
   style={`left: ${rect.x}px; top: ${rect.y}px; width: ${rect.width}px; min-height: ${rect.height}px; border-color: ${node.color ?? "#2563eb"}`}
   onpointerdown={(event) => onStartDrag(event, node.id, rect.x, rect.y)}
 >
-  <span class="node-dot" style={`background: ${node.color ?? "#2563eb"}`}></span>
-  <input
-    data-testid="node-label"
-    value={node.label}
-    disabled={previewState}
-    oninput={(event) => onRename(node.id, "label", event.currentTarget.value)}
-    onfocus={() => onFocusLabel(node.id)}
-  />
-  <button
-    class="connect-handle"
-    aria-label={`Connect ${node.label}`}
-    onpointerdown={(event) => onStartLink(event, node.id)}
-  >
-    <Link2 size={13} />
-  </button>
-  {#if selected}
-    <ResizeHandles onResizeStart={(handle, event) => onStartResize(event, node.id, handle, rect)} />
-  {/if}
+  <div class="node-content">
+    <span class="node-icon">
+      {#if node.kind === "trigger"}
+        <Zap size={14} />
+      {:else if node.kind === "decision"}
+        <GitBranch size={14} />
+      {:else}
+        <Play size={14} />
+      {/if}
+    </span>
+    <input
+      data-testid="node-label"
+      value={node.label}
+      disabled={previewState}
+      oninput={(event) => onRename(node.id, "label", event.currentTarget.value)}
+      onfocus={() => onFocusLabel(node.id)}
+    />
+    <button
+      class="connect-handle"
+      aria-label={`Connect ${node.label}`}
+      onpointerdown={(event) => onStartLink(event, node.id)}
+    >
+      <Link2 size={13} />
+    </button>
+    {#if selected}
+      <ResizeHandles onResizeStart={(handle, event) => onStartResize(event, node.id, handle, rect)} />
+    {/if}
+  </div>
 </article>
