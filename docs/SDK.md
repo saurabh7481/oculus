@@ -77,7 +77,7 @@ await lock.release();
 - List and tree helpers cover ordered UI state such as layers, kanban columns, outlines, and design-tool hierarchies.
 - `room.apply(...)` is the advanced escape hatch for raw operations and native Yjs updates.
 
-Mutations apply optimistically to local state immediately. If the server accepts the mutation, the promise resolves after ack. If the server rejects or the mutation times out, the SDK rolls back to the previous local state. If the room is offline, mutations are queued locally and flushed after reconnect.
+Mutations apply optimistically to local state immediately. If the server accepts the mutation, the promise resolves after ack. If the server rejects or the mutation times out, the SDK rolls back to the previous local state. If the room is offline, mutations are queued locally, the room reports the queued count, and queued operations flush after reconnect against the fresh server room version.
 
 ## Core Client
 
@@ -85,6 +85,7 @@ Mutations apply optimistically to local state immediately. If the server accepts
 const client = createClient({
   serverUrl: "http://localhost:3000",
   userId: "user_123",
+  roles: ["editor"],
   authToken: "optional-token"
 });
 ```
@@ -97,6 +98,7 @@ Options:
 
 - `serverUrl`: HTTP base URL for the Oculus server. The SDK converts it to WebSocket URLs for room connections.
 - `userId`: optional stable user id for presence, locks, tombstones, and event attribution.
+- `roles`: optional caller-provided role names for self-hosted server permission checks. Oculus sends these to the server; your deployment should derive them from trusted auth context.
 - `authToken`: optional token reserved for self-hosted authenticated server flows.
 
 ### `client.room<S>(roomId, options?)`
@@ -110,12 +112,26 @@ const room = client.room<WorkflowState>("workflow_123");
 Options:
 
 - `schema`: optional Zod schema. Mutations are validated against the next optimistic state before they are sent.
+- `reconnect`: optional reconnect behavior. Defaults to enabled exponential backoff with jitter.
+
+```ts
+const room = client.room<WorkflowState>("workflow_123", {
+  reconnect: {
+    enabled: true,
+    minDelay: 250,
+    maxDelay: 5_000,
+    jitter: 0.25
+  }
+});
+```
 
 ## Rooms
 
 ### `room.connect()`
 
 Opens the WebSocket connection and resolves after the server sends `room_init`.
+
+If a socket closes unexpectedly, the room enters `reconnecting`, schedules a reconnect with backoff, receives a fresh `room_init`, then flushes queued operations while reporting `syncing`.
 
 ### `room.disconnect()`
 
@@ -132,6 +148,20 @@ Returns the latest server version known by the client.
 ### `room.isConnected()`
 
 Returns whether the WebSocket is connected.
+
+### `room.getSyncState()`
+
+Returns the current connection and queue state.
+
+```ts
+const sync = room.getSyncState();
+
+sync.status; // "offline" | "connecting" | "connected" | "reconnecting" | "syncing"
+sync.queuedOperations; // offline or reconnecting mutations waiting to flush
+sync.pendingOperations; // sent mutations waiting for server ack
+```
+
+Queued mutations are optimistic: the local state updates immediately even while offline. On reconnect, the SDK starts from the latest server `room_init`, applies queued operations against that fresh version, sends them to the server, and leaves `syncing` once acks complete.
 
 ### `room.on(event, handler)`
 
@@ -152,6 +182,7 @@ Events:
 - `users_change`: connected users changed.
 - `presence_change`: another client sent presence.
 - `remote_mutation`: another client mutation arrived.
+- `sync_state_change`: connection status, queued count, pending count, or known version changed.
 
 ## Collections
 
@@ -340,6 +371,35 @@ Fetches reconstructed room state at a specific version.
 
 Replay uses snapshots plus the event log when the server is running with persistent storage.
 
+## Server Permissions
+
+Self-hosted apps can define operation-level permission rules on the server. Rules match operation paths, operation types, and caller roles. Unauthorized mutations are rejected before they change room state or enter the event log; the SDK then rolls back the optimistic local change.
+
+```ts
+const coordinator = new RoomCoordinator(store);
+
+coordinator.definePermissions("workflow_123", [
+  { path: "nodes.*", operations: ["set", "insert", "delete", "tombstone-delete"], roles: ["editor", "admin"] },
+  { path: "nodes.*.x", operations: ["set", "update"], roles: ["editor", "admin"] },
+  { path: "nodes.*.label", operations: ["set", "update", "text"], roles: ["viewer", "editor", "admin"] },
+  { path: "edges.*", roles: ["admin"] }
+]);
+```
+
+Path rules use `*` for a single path segment. For example, `nodes.*.label` matches `nodes.node_1.label`, and `edges.*` matches `edges.edge_1`. Pass a room id to define room-local rules, or pass only the rule array to define coordinator-wide default rules.
+
+The SDK can send roles with the connection:
+
+```ts
+const client = createClient({
+  serverUrl: "http://localhost:3000",
+  userId: "ada",
+  roles: ["editor"]
+});
+```
+
+Important: roles are caller-provided context for self-hosted deployments. In production, derive them from your own trusted auth/session layer before constructing the client or upgrading the WebSocket. Do not let untrusted browser code invent privileged roles.
+
 ## Advanced Engine API
 
 Most apps should start with `collection`, `text`, `list`, `tree`, and `presence`. Use this section when you are writing adapters, importing external CRDT updates, building specialized editors, or testing engine behavior directly.
@@ -421,7 +481,9 @@ Applies operations immutably to a local state object. This is useful for tests, 
 ```ts
 import { createOculusRoomStore } from "@oculus/svelte";
 
-const room = createOculusRoomStore<WorkflowState>(client, "workflow_123");
+const room = createOculusRoomStore<WorkflowState>(client, "workflow_123", {
+  reconnect: { minDelay: 250, maxDelay: 5_000 }
+});
 ```
 
 The Svelte store exposes:
@@ -429,6 +491,10 @@ The Svelte store exposes:
 - `state`: readable room state store.
 - `version`: readable server version store.
 - `connected`: readable connection state store.
+- `connectionStatus`: readable `"offline" | "connecting" | "connected" | "reconnecting" | "syncing"` store.
+- `syncState`: readable `SyncState` store with status, queued count, pending count, and version.
+- `queuedOperations`: readable count of offline/reconnect queued operation batches.
+- `syncing`: readable boolean for the queued-operation flush phase.
 - `users`: readable connected users store.
 - `cursors`: readable cursor presence map.
 - `events`: readable event log store.
@@ -449,18 +515,25 @@ Example:
   import { client } from "./collab";
 
   const room = createOculusRoomStore(client, "workflow_123");
-  const { state, connected, cursors } = room;
+  const { state, connected, connectionStatus, queuedOperations, cursors } = room;
 </script>
 
 {#if $connected}
   <pre>{JSON.stringify($state, null, 2)}</pre>
+{:else}
+  <p>{$connectionStatus}: {$queuedOperations} queued changes</p>
 {/if}
 ```
 
 ## Public Types
 
 - `OculusClientOptions`: options for `createClient`.
-- `RoomOptions`: options for `client.room`, currently including optional Zod schema validation.
+- `RoomOptions`: options for `client.room`, currently including optional Zod schema validation and reconnect settings.
+- `ReconnectOptions`: reconnect backoff settings.
+- `ConnectionStatus`: `"offline" | "connecting" | "connected" | "reconnecting" | "syncing"`.
+- `SyncState`: status, connected boolean, queued operation count, pending operation count, and known room version.
+- `PermissionRule`: server permission rule with path pattern, operation types, and allowed roles.
+- `PermissionContext`: server-side caller context used when checking permission rules.
 - `OculusClient`: client object returned by `createClient`.
 - `OculusRoom<S>`: room object returned by `client.room`.
 - `OculusCollection<T>`: collection helper returned by `room.collection` and `room.items`.

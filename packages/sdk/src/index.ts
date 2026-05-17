@@ -109,10 +109,29 @@ export type OculusClientOptions = {
   serverUrl: string;
   authToken?: string;
   userId?: string;
+  roles?: string[];
+};
+
+export type ConnectionStatus = "offline" | "connecting" | "connected" | "reconnecting" | "syncing";
+
+export type ReconnectOptions = {
+  enabled?: boolean;
+  minDelay?: number;
+  maxDelay?: number;
+  jitter?: number;
+};
+
+export type SyncState = {
+  status: ConnectionStatus;
+  connected: boolean;
+  queuedOperations: number;
+  pendingOperations: number;
+  version: number;
 };
 
 export type RoomOptions<S = Record<string, unknown>> = {
   schema?: z.ZodType<S>;
+  reconnect?: ReconnectOptions;
 };
 
 type Handler<T = unknown> = (payload: T) => void;
@@ -177,6 +196,7 @@ export class OculusRoom<S = Record<string, unknown>> {
   private state = {} as S;
   private version = 0;
   private connected = false;
+  private connectionStatus: ConnectionStatus = "offline";
   private clientId = getOrCreateClientId();
   private pending = new Map<
     string,
@@ -192,6 +212,11 @@ export class OculusRoom<S = Record<string, unknown>> {
   private lastPresenceSend = 0;
   private presenceTimer: ReturnType<typeof setTimeout> | null = null;
   private queuedPresence: Record<string, unknown> | null = null;
+  private connectPromise: Promise<void> | null = null;
+  private manualDisconnect = false;
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushingQueueCount = 0;
 
   constructor(
     private readonly roomId: string,
@@ -259,10 +284,24 @@ export class OculusRoom<S = Record<string, unknown>> {
   }
 
   async connect(): Promise<void> {
-    if (this.connected) return;
+    if (this.connected && this.connectionStatus === "connected") return;
+    if (this.connectPromise) return this.connectPromise;
+
+    this.manualDisconnect = false;
+    this.clearReconnectTimer();
+    const status = this.connectionStatus === "reconnecting" ? "reconnecting" : "connecting";
+    this.connectPromise = this.openSocket(status).finally(() => {
+      this.connectPromise = null;
+    });
+    return this.connectPromise;
+  }
+
+  private async openSocket(status: ConnectionStatus): Promise<void> {
+    this.setConnectionStatus(status);
 
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(this.getSocketUrl());
+      let initialized = false;
       this.socket = socket;
 
       socket.onopen = () => {
@@ -271,28 +310,44 @@ export class OculusRoom<S = Record<string, unknown>> {
       };
 
       socket.onerror = () => {
-        reject(new Error("Unable to connect to Oculus room"));
+        if (!initialized) reject(new Error("Unable to connect to Oculus room"));
+        if (!this.manualDisconnect) this.scheduleReconnect();
       };
 
       socket.onclose = () => {
         this.connected = false;
         this.emit("connection_change", false);
+        if (!this.manualDisconnect) {
+          this.scheduleReconnect();
+        } else {
+          this.setConnectionStatus("offline");
+        }
+        if (!initialized) reject(new Error("Oculus room connection closed before initialization"));
       };
 
       socket.onmessage = (event) => {
         const message = JSON.parse(String(event.data)) as ServerMessage;
         this.handleMessage(message);
-        if (message.type === "room_init") resolve();
+        if (message.type === "room_init") {
+          initialized = true;
+          resolve();
+        }
       };
     });
 
+    this.reconnectAttempts = 0;
+    if (this.offlineQueue.length > 0) this.setConnectionStatus("syncing");
     await this.flushOfflineQueue();
+    this.setConnectionStatus("connected");
   }
 
   disconnect(): void {
+    this.manualDisconnect = true;
+    this.clearReconnectTimer();
     this.socket?.close();
     this.socket = null;
     this.connected = false;
+    this.setConnectionStatus("offline");
   }
 
   getState(): S {
@@ -305,6 +360,16 @@ export class OculusRoom<S = Record<string, unknown>> {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  getSyncState(): SyncState {
+    return {
+      status: this.connectionStatus,
+      connected: this.connected,
+      queuedOperations: this.offlineQueue.length + this.flushingQueueCount,
+      pendingOperations: this.pending.size,
+      version: this.version
+    };
   }
 
   on<T = unknown>(event: string, handler: Handler<T>): () => void {
@@ -338,12 +403,14 @@ export class OculusRoom<S = Record<string, unknown>> {
 
     if (!this.connected || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
       this.offlineQueue.push(operations);
+      this.emitSyncState();
       return { status: "queued" };
     }
 
     const operationId = randomId();
     return new Promise((resolve, reject) => {
       this.pending.set(operationId, { operations, previousState, resolve, reject });
+      this.emitSyncState();
       this.socket?.send(
         JSON.stringify({
           type: "mutation",
@@ -359,6 +426,7 @@ export class OculusRoom<S = Record<string, unknown>> {
         this.pending.delete(operationId);
         this.state = pending.previousState;
         this.emit("state_change", this.getState());
+        this.emitSyncState();
         reject(new Error("Mutation timed out"));
       }, 10_000);
     });
@@ -370,6 +438,7 @@ export class OculusRoom<S = Record<string, unknown>> {
       this.state = message.state as S;
       this.emit("state_change", this.getState());
       this.emit("users_change", message.connectedUsers);
+      this.emitSyncState();
       return;
     }
 
@@ -380,10 +449,12 @@ export class OculusRoom<S = Record<string, unknown>> {
 
       if (message.status === "accepted") {
         this.version = message.serverVersion ?? this.version;
+        this.emitSyncState();
         pending.resolve(message);
       } else {
         this.state = pending.previousState;
         this.emit("state_change", this.getState());
+        this.emitSyncState();
         pending.reject(new Error(message.reason ?? "Mutation rejected"));
       }
       return;
@@ -394,6 +465,7 @@ export class OculusRoom<S = Record<string, unknown>> {
       this.state = applyOperations(this.state as Record<string, unknown>, message.operations) as S;
       this.emit("state_change", this.getState());
       this.emit("remote_mutation", message);
+      this.emitSyncState();
       return;
     }
 
@@ -410,9 +482,44 @@ export class OculusRoom<S = Record<string, unknown>> {
   private async flushOfflineQueue(): Promise<void> {
     const queued = [...this.offlineQueue];
     this.offlineQueue = [];
+    this.flushingQueueCount = queued.length;
+    this.emitSyncState();
     for (const operations of queued) {
       await this.mutate(operations);
+      this.flushingQueueCount -= 1;
+      this.emitSyncState();
     }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.manualDisconnect || this.reconnectTimer) return;
+    if (this.roomOptions?.reconnect?.enabled === false) {
+      this.setConnectionStatus("offline");
+      return;
+    }
+
+    this.setConnectionStatus("reconnecting");
+    const delay = this.getReconnectDelay();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect().catch(() => undefined);
+    }, delay);
+  }
+
+  private getReconnectDelay(): number {
+    const minDelay = this.roomOptions?.reconnect?.minDelay ?? 250;
+    const maxDelay = this.roomOptions?.reconnect?.maxDelay ?? 5_000;
+    const jitter = this.roomOptions?.reconnect?.jitter ?? 0.25;
+    const exponentialDelay = Math.min(maxDelay, minDelay * 2 ** this.reconnectAttempts);
+    this.reconnectAttempts += 1;
+    const spread = exponentialDelay * jitter;
+    return Math.max(0, Math.round(exponentialDelay - spread + Math.random() * spread * 2));
+  }
+
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
   }
 
   private sendPresence(data: Record<string, unknown>): void {
@@ -433,6 +540,7 @@ export class OculusRoom<S = Record<string, unknown>> {
     const url = new URL(`${base}/rooms/${encodeURIComponent(this.roomId)}`);
     if (this.clientOptions.userId) url.searchParams.set("userId", this.clientOptions.userId);
     if (this.clientOptions.authToken) url.searchParams.set("token", this.clientOptions.authToken);
+    if (this.clientOptions.roles?.length) url.searchParams.set("roles", this.clientOptions.roles.join(","));
     url.searchParams.set("clientId", this.clientId);
     return url.toString();
   }
@@ -443,6 +551,19 @@ export class OculusRoom<S = Record<string, unknown>> {
 
   private emit<T = unknown>(event: string, payload: T): void {
     this.handlers.get(event)?.forEach((handler) => handler(payload));
+  }
+
+  private setConnectionStatus(status: ConnectionStatus): void {
+    if (this.connectionStatus === status) {
+      this.emitSyncState();
+      return;
+    }
+    this.connectionStatus = status;
+    this.emitSyncState();
+  }
+
+  private emitSyncState(): void {
+    this.emit("sync_state_change", this.getSyncState());
   }
 }
 

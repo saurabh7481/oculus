@@ -14,6 +14,7 @@ import type { ClientMessage, ServerMessage } from "./protocol";
 type ClientContext = {
   roomId: string;
   userId: string;
+  roles: string[];
   clientId: string;
   initialVersion: number;
   initialState: Record<string, unknown>;
@@ -41,6 +42,18 @@ coordinator.defineCollection("nodes", {
   }
 });
 
+coordinator.definePermissions("workflow_123", [
+  { path: "nodes.*", operations: ["set", "insert", "delete", "tombstone-delete"], roles: ["editor", "admin"] },
+  { path: "nodes.*.x", operations: ["set", "update"], roles: ["editor", "admin"] },
+  { path: "nodes.*.y", operations: ["set", "update"], roles: ["editor", "admin"] },
+  { path: "nodes.*.color", operations: ["set", "update"], roles: ["editor", "admin"] },
+  { path: "nodes.*.label", operations: ["set", "update", "text"], roles: ["editor", "admin"] },
+  { path: "nodes.*.lockedBy", operations: ["lock", "set", "update"], roles: ["editor", "admin"] },
+  { path: "edges.*", operations: ["set", "insert", "delete", "tombstone-delete"], roles: ["editor", "admin"] },
+  { path: "layers", operations: ["set", "list-move"], roles: ["editor", "admin"] },
+  { path: "tree", operations: ["set", "tree-move"], roles: ["editor", "admin"] }
+]);
+
 const demoState = {
   nodes: {
     start: { id: "start", x: 120, y: 160, label: "Start", color: "#2563eb" },
@@ -66,6 +79,7 @@ Bun.serve<ClientContext>({
     if (roomMatch && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
       const roomId = decodeURIComponent(roomMatch[1] ?? "");
       const userId = url.searchParams.get("userId") || `user-${crypto.randomUUID().slice(0, 8)}`;
+      const roles = parseRoles(url);
       const clientId = url.searchParams.get("clientId") || crypto.randomUUID();
       const roomState = await coordinator.loadRoom(
         roomId,
@@ -76,6 +90,7 @@ Bun.serve<ClientContext>({
         data: {
           roomId,
           userId,
+          roles,
           clientId,
           initialVersion: roomState.version,
           initialState: roomState.state
@@ -174,6 +189,7 @@ async function handleMutation(
   const result = await coordinator.applyMutation({
     roomId: ws.data.roomId,
     userId: ws.data.userId,
+    roles: ws.data.roles,
     clientId: ws.data.clientId,
     operationId: message.operationId,
     baseVersion: message.baseVersion,
@@ -237,6 +253,15 @@ function broadcast(roomId: string, message: ServerMessage, except?: OculusSocket
 
 function send(socket: OculusSocket, message: ServerMessage): void {
   socket.send(JSON.stringify(message));
+}
+
+function parseRoles(url: URL): string[] {
+  const rolesParam = url.searchParams.get("roles") ?? url.searchParams.get("role");
+  const roles = rolesParam
+    ?.split(",")
+    .map((role) => role.trim())
+    .filter(Boolean);
+  return roles && roles.length > 0 ? roles : ["editor"];
 }
 
 function json(payload: unknown, status = 200): Response {

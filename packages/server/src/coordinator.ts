@@ -92,6 +92,20 @@ export type CollectionConfig = {
   fields?: Record<string, FieldStrategy>;
 };
 
+export type PermissionOperation = Operation["op"] | "*";
+
+export type PermissionRule = {
+  path: string;
+  operations?: PermissionOperation[];
+  roles: string[];
+};
+
+export type PermissionContext = {
+  userId: string;
+  clientId: string;
+  roles: string[];
+};
+
 export type RoomEvent = {
   roomId: string;
   userId: string;
@@ -194,12 +208,25 @@ export class MemoryEventStore implements EventStore {
 export class RoomCoordinator {
   private rooms = new Map<string, RoomCacheEntry>();
   private collectionConfigs = new Map<string, CollectionConfig>();
+  private permissionRules = new Map<string, PermissionRule[]>();
   private mutationQueues = new Map<string, Promise<void>>();
 
   constructor(private readonly store: EventStore = new MemoryEventStore()) {}
 
   defineCollection(name: string, config: CollectionConfig): void {
     this.collectionConfigs.set(name, config);
+  }
+
+  definePermissions(rules: PermissionRule[]): void;
+  definePermissions(roomId: string, rules: PermissionRule[]): void;
+  definePermissions(roomIdOrRules: string | PermissionRule[], maybeRules?: PermissionRule[]): void {
+    const roomId = typeof roomIdOrRules === "string" ? roomIdOrRules : "*";
+    const rules = typeof roomIdOrRules === "string" ? maybeRules ?? [] : roomIdOrRules;
+    this.permissionRules.set(roomId, rules.map((rule) => ({
+      path: rule.path,
+      operations: rule.operations ? [...rule.operations] : undefined,
+      roles: [...rule.roles]
+    })));
   }
 
   async loadRoom(roomId: string, defaultState: Record<string, unknown> = {}): Promise<{
@@ -250,6 +277,7 @@ export class RoomCoordinator {
   async applyMutation(params: {
     roomId: string;
     userId: string;
+    roles?: string[];
     clientId: string;
     operationId: string;
     baseVersion: number;
@@ -269,6 +297,7 @@ export class RoomCoordinator {
   private async applyMutationUnlocked(params: {
     roomId: string;
     userId: string;
+    roles?: string[];
     clientId: string;
     operationId: string;
     baseVersion: number;
@@ -285,6 +314,15 @@ export class RoomCoordinator {
     const room = this.rooms.get(params.roomId);
     if (!room) {
       return { status: "rejected", reason: "room_not_loaded" };
+    }
+
+    const permissionDeniedPath = this.getPermissionDeniedPath(params.roomId, params.operations, {
+      userId: params.userId,
+      clientId: params.clientId,
+      roles: params.roles ?? []
+    });
+    if (permissionDeniedPath) {
+      return { status: "rejected", reason: `permission_denied:${permissionDeniedPath}` };
     }
 
     const transformedOperations = this.transformOperations(
@@ -435,6 +473,35 @@ export class RoomCoordinator {
     _currentVersion: number
   ): Operation[] {
     return clone(operations);
+  }
+
+  private getPermissionDeniedPath(
+    roomId: string,
+    operations: Operation[],
+    context: PermissionContext
+  ): string | undefined {
+    const rules = this.getPermissionRules(roomId);
+    if (rules.length === 0) return undefined;
+
+    for (const operation of operations) {
+      if (!this.isOperationAllowed(operation, context, rules)) {
+        return operation.path;
+      }
+    }
+
+    return undefined;
+  }
+
+  private getPermissionRules(roomId: string): PermissionRule[] {
+    return this.permissionRules.get(roomId) ?? this.permissionRules.get("*") ?? [];
+  }
+
+  private isOperationAllowed(operation: Operation, context: PermissionContext, rules: PermissionRule[]): boolean {
+    return rules.some((rule) => {
+      if (!matchesPathPattern(rule.path, operation.path)) return false;
+      if (rule.operations && !rule.operations.includes("*") && !rule.operations.includes(operation.op)) return false;
+      return rule.roles.includes("*") || context.roles.some((role) => rule.roles.includes(role));
+    });
   }
 
   private applyOperations(
@@ -657,6 +724,14 @@ function hasTombstoneAncestor(obj: Record<string, unknown>, path: string): boole
     }
   }
   return false;
+}
+
+function matchesPathPattern(pattern: string, path: string): boolean {
+  const patternParts = pattern.split(".");
+  const pathParts = path.split(".");
+  if (patternParts.length !== pathParts.length) return false;
+
+  return patternParts.every((part, index) => part === "*" || part === pathParts[index]);
 }
 
 function clampInteger(value: number, min: number, max: number): number {

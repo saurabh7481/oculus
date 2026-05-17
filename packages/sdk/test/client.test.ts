@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   applyOperations,
+  type ConnectionStatus,
   createCollectionOperations,
   createClient,
   createListMoveOperation,
@@ -10,6 +11,13 @@ import {
   createYjsTextOperation,
   type Operation
 } from "../src/index";
+
+const originalWebSocket = globalThis.WebSocket;
+
+afterEach(() => {
+  globalThis.WebSocket = originalWebSocket;
+  FakeWebSocket.instances = [];
+});
 
 type WorkflowNode = {
   id: string;
@@ -235,3 +243,186 @@ describe("developer-friendly room API", () => {
     });
   });
 });
+
+describe("offline recovery and sync status", () => {
+  it("tracks queued offline operations in public sync state", async () => {
+    const room = createClient({ serverUrl: "http://localhost:3000", userId: "user_1" }).room<WorkflowState>(
+      "workflow_123"
+    );
+    const seen: ConnectionStatus[] = [];
+    room.on<{ status: ConnectionStatus }>("sync_state_change", (state) => seen.push(state.status));
+
+    await room.collection<WorkflowNode>("nodes").create("node_1", {
+      id: "node_1",
+      x: 120,
+      y: 160,
+      label: "Queued"
+    });
+
+    expect(room.getSyncState()).toMatchObject({
+      status: "offline",
+      connected: false,
+      queuedOperations: 1,
+      pendingOperations: 0
+    });
+    expect(seen).toContain("offline");
+  });
+
+  it("rebases queued operations onto fresh room state before flushing after reconnect", async () => {
+    installFakeWebSocket();
+    const room = createClient({ serverUrl: "http://localhost:3000", userId: "user_1" }).room<WorkflowState>(
+      "workflow_123",
+      { reconnect: { minDelay: 1, maxDelay: 1, jitter: 0 } }
+    );
+
+    await room.collection<WorkflowNode>("nodes").create("offline_node", {
+      id: "offline_node",
+      x: 120,
+      y: 160,
+      label: "Offline"
+    });
+
+    const connected = room.connect();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    socket.message({
+      type: "room_init",
+      version: 10,
+      state: {
+        nodes: {
+          server_node: { id: "server_node", x: 20, y: 30, label: "Server" }
+        }
+      },
+      connectedUsers: []
+    });
+
+    await waitFor(() => socket.sent.length === 1);
+    const mutation = JSON.parse(socket.sent[0]!) as { operationId: string; baseVersion: number };
+
+    expect(mutation.baseVersion).toBe(10);
+    expect(room.getSyncState()).toMatchObject({ status: "syncing", queuedOperations: 1 });
+    expect(room.getState()).toEqual({
+      nodes: {
+        server_node: { id: "server_node", x: 20, y: 30, label: "Server" },
+        offline_node: { id: "offline_node", x: 120, y: 160, label: "Offline" }
+      }
+    });
+
+    socket.message({
+      type: "mutation_ack",
+      operationId: mutation.operationId,
+      serverVersion: 11,
+      status: "accepted"
+    });
+
+    await connected;
+
+    expect(room.getSyncState()).toMatchObject({
+      status: "connected",
+      connected: true,
+      queuedOperations: 0,
+      pendingOperations: 0,
+      version: 11
+    });
+  });
+
+  it("moves to reconnecting after an unexpected socket close", async () => {
+    installFakeWebSocket();
+    const room = createClient({ serverUrl: "http://localhost:3000" }).room<WorkflowState>("workflow_123", {
+      reconnect: { minDelay: 1, maxDelay: 1, jitter: 0 }
+    });
+
+    const connected = room.connect();
+    const firstSocket = FakeWebSocket.instances[0]!;
+    firstSocket.open();
+    firstSocket.message({ type: "room_init", version: 1, state: {}, connectedUsers: [] });
+    await connected;
+
+    firstSocket.closeUnexpectedly();
+
+    expect(room.getSyncState().status).toBe("reconnecting");
+    await waitFor(() => FakeWebSocket.instances.length === 2);
+  });
+
+  it("sends caller-provided roles when connecting to a self-hosted server", async () => {
+    installFakeWebSocket();
+    const room = createClient({
+      serverUrl: "http://localhost:3000",
+      userId: "admin_1",
+      roles: ["admin", "editor"]
+    }).room<WorkflowState>("workflow_123");
+
+    const connected = room.connect();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    socket.message({ type: "room_init", version: 1, state: {}, connectedUsers: [] });
+    await connected;
+
+    const url = new URL(socket.url);
+    expect(url.searchParams.get("userId")).toBe("admin_1");
+    expect(url.searchParams.get("roles")).toBe("admin,editor");
+  });
+});
+
+type FakeServerMessage =
+  | { type: "room_init"; version: number; state: Record<string, unknown>; connectedUsers: unknown[] }
+  | {
+      type: "mutation_ack";
+      operationId: string;
+      serverVersion?: number;
+      status: "accepted" | "rejected";
+      reason?: string;
+    };
+
+class FakeWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 3;
+  static instances: FakeWebSocket[] = [];
+
+  readyState = FakeWebSocket.CONNECTING;
+  sent: string[] = [];
+  onopen: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+
+  constructor(readonly url: string) {
+    FakeWebSocket.instances.push(this);
+  }
+
+  send(data: string): void {
+    this.sent.push(data);
+  }
+
+  close(): void {
+    this.readyState = FakeWebSocket.CLOSED;
+    this.onclose?.();
+  }
+
+  open(): void {
+    this.readyState = FakeWebSocket.OPEN;
+    this.onopen?.();
+  }
+
+  message(message: FakeServerMessage): void {
+    this.onmessage?.({ data: JSON.stringify(message) });
+  }
+
+  closeUnexpectedly(): void {
+    this.readyState = FakeWebSocket.CLOSED;
+    this.onclose?.();
+  }
+}
+
+function installFakeWebSocket(): void {
+  globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+}
+
+async function waitFor(assertion: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (assertion()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("Timed out waiting for condition");
+}

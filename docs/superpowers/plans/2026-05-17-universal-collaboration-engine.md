@@ -88,9 +88,9 @@ type Operation =
 - Modify: `docs/SDK.md`
 - Modify: `docs/NEXT_STEPS.md`
 
-- [ ] Define room-local permission rules by path pattern and operation type.
-- [ ] Reject unauthorized operations before applying or persisting them.
-- [ ] Keep auth pluggable for self-hosted deployments: the server consumes caller-provided user/role context instead of issuing paid platform API keys.
+- [x] Define room-local permission rules by path pattern and operation type.
+- [x] Reject unauthorized operations before applying or persisting them.
+- [x] Keep auth pluggable for self-hosted deployments: the server consumes caller-provided user/role context instead of issuing paid platform API keys.
 
 ### Task 6: Add Reconnect And Offline Recovery
 
@@ -101,10 +101,10 @@ type Operation =
 - Test: `packages/sdk/test/client.test.ts`
 - Modify: `docs/SDK.md`
 
-- [ ] Add reconnect backoff with jitter.
-- [ ] Surface connection status as connected, reconnecting, offline, and syncing.
-- [ ] Flush queued operations after fresh `room_init`.
-- [ ] Show queued operation count in the demo.
+- [x] Add reconnect backoff with jitter.
+- [x] Surface connection status as connected, reconnecting, offline, and syncing.
+- [x] Flush queued operations after fresh `room_init`.
+- [x] Show queued operation count in the demo.
 
 ### Task 7: Expand Replay Into A Debugger
 

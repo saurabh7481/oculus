@@ -40,7 +40,7 @@
 
   const roomId = "workflow_123";
   const room = createOculusRoomStore<WorkflowState>(client, roomId);
-  const { state, version, connected, users, cursors, events } = room;
+  const { state, version, connected, connectionStatus, queuedOperations, syncing, users, cursors, events } = room;
 
   let dragging: string | null = null;
   let linkMode = false;
@@ -58,6 +58,24 @@
     storageInfo?.latestSnapshotVersion === null || storageInfo?.latestSnapshotVersion === undefined
       ? "pending"
       : `v${storageInfo.latestSnapshotVersion}`;
+  $: statusLabel =
+    $connectionStatus === "connected"
+      ? "Connected"
+      : $connectionStatus === "connecting"
+        ? "Connecting"
+        : $connectionStatus === "reconnecting"
+          ? "Reconnecting"
+          : $connectionStatus === "syncing"
+            ? "Syncing queued work"
+            : "Offline queueing";
+  $: statusDetail =
+    $queuedOperations > 0
+      ? `${$queuedOperations} queued ${$queuedOperations === 1 ? "change" : "changes"}`
+      : $syncing
+        ? "Finishing sync"
+        : $connected
+          ? "Live"
+          : "Changes stay local";
   $: if ($version >= 0) {
     void refreshStorageInfo();
   }
@@ -150,14 +168,18 @@
         <h1>Collaborative Workflow Builder</h1>
       </div>
       <div class="actions">
-        <span class={$connected ? "status online" : "status offline"}>
-          {#if $connected}
+        <span class={`status ${$connectionStatus}`}>
+          {#if $connectionStatus === "connected"}
             <Wifi size={15} />
-            Connected
+          {:else if $connectionStatus === "connecting" || $connectionStatus === "reconnecting" || $connectionStatus === "syncing"}
+            <RotateCcw size={15} />
           {:else}
             <WifiOff size={15} />
-            Offline queueing
           {/if}
+          <span>
+            {statusLabel}
+            <small>{statusDetail}</small>
+          </span>
         </span>
         <button on:click={addNode}>
           <Plus size={16} />
@@ -258,6 +280,14 @@
       <div class="metric">
         <span>Version</span>
         <strong>{$version}</strong>
+      </div>
+      <div class="metric">
+        <span>Sync</span>
+        <strong>{statusLabel}</strong>
+      </div>
+      <div class="metric">
+        <span>Queued</span>
+        <strong>{$queuedOperations}</strong>
       </div>
       <div class="metric">
         <span>Users</span>

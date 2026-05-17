@@ -1,5 +1,12 @@
 import { derived, get, writable, type Readable } from "svelte/store";
-import type { OculusClient, OculusRoom, PresenceUser, RoomEvent } from "@oculus/sdk";
+import type {
+  ConnectionStatus,
+  OculusClient,
+  PresenceUser,
+  RoomEvent,
+  RoomOptions,
+  SyncState
+} from "@oculus/sdk";
 
 export type CursorPresence = {
   x: number;
@@ -12,6 +19,10 @@ export type OculusRoomStore<S extends Record<string, unknown>> = {
   state: Readable<S>;
   version: Readable<number>;
   connected: Readable<boolean>;
+  connectionStatus: Readable<ConnectionStatus>;
+  syncState: Readable<SyncState>;
+  queuedOperations: Readable<number>;
+  syncing: Readable<boolean>;
   users: Readable<PresenceUser[]>;
   cursors: Readable<Record<string, CursorPresence>>;
   events: Readable<RoomEvent[]>;
@@ -27,16 +38,29 @@ export type OculusRoomStore<S extends Record<string, unknown>> = {
 
 export function createOculusRoomStore<S extends Record<string, unknown>>(
   client: OculusClient,
-  roomId: string
+  roomId: string,
+  options?: RoomOptions<S>
 ): OculusRoomStore<S> {
-  const room = client.room<S>(roomId);
+  const room = client.room<S>(roomId, options);
   const state = writable<S>({} as S);
   const version = writable(0);
   const connected = writable(false);
+  const syncState = writable<SyncState>(room.getSyncState());
+  const connectionStatus = writable<ConnectionStatus>(room.getSyncState().status);
+  const queuedOperations = writable(room.getSyncState().queuedOperations);
   const users = writable<PresenceUser[]>([]);
   const cursors = writable<Record<string, CursorPresence>>({});
   const events = writable<RoomEvent[]>([]);
   const ready = derived([connected, state], ([$connected]) => $connected);
+  const syncing = derived(syncState, ($syncState) => $syncState.status === "syncing");
+
+  const setSyncState = (nextSyncState: SyncState) => {
+    syncState.set(nextSyncState);
+    connectionStatus.set(nextSyncState.status);
+    queuedOperations.set(nextSyncState.queuedOperations);
+    connected.set(nextSyncState.connected);
+    version.set(nextSyncState.version);
+  };
 
   const refreshEvents = async () => {
     events.set(await room.getEvents());
@@ -49,6 +73,7 @@ export function createOculusRoomStore<S extends Record<string, unknown>>(
   });
 
   room.on<boolean>("connection_change", connected.set);
+  room.on<SyncState>("sync_state_change", setSyncState);
   room.on<PresenceUser[]>("users_change", users.set);
   room.on<{
     userId: string;
@@ -71,15 +96,19 @@ export function createOculusRoomStore<S extends Record<string, unknown>>(
     .then(async () => {
       state.set(room.getState());
       version.set(room.getVersion());
-      connected.set(room.isConnected());
+      setSyncState(room.getSyncState());
       await refreshEvents();
     })
-    .catch(() => connected.set(false));
+    .catch(() => setSyncState(room.getSyncState()));
 
   return {
     state,
     version,
     connected,
+    connectionStatus,
+    syncState,
+    queuedOperations,
+    syncing,
     users,
     cursors,
     events,

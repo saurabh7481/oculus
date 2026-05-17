@@ -157,6 +157,150 @@ describe("RoomCoordinator", () => {
     expect(coordinator.getRoomState("failure_room")).toEqual({ nodes: {} });
   });
 
+  it("rejects unauthorized operations before changing state or storing events", async () => {
+    const { coordinator, store } = createCoordinator();
+    coordinator.definePermissions([
+      { path: "nodes.*.x", operations: ["set", "update"], roles: ["editor", "admin"] },
+      { path: "nodes.*.label", operations: ["set", "update", "text"], roles: ["viewer", "editor", "admin"] },
+      { path: "edges.*", roles: ["admin"] }
+    ]);
+    await coordinator.loadRoom("permission_room", {
+      nodes: {
+        node_1: { id: "node_1", x: 100, label: "Start" }
+      },
+      edges: {}
+    });
+
+    const result = await coordinator.applyMutation({
+      roomId: "permission_room",
+      userId: "viewer_1",
+      roles: ["viewer"],
+      clientId: "c1",
+      operationId: "op_1",
+      baseVersion: 0,
+      operations: [{ op: "set", path: "nodes.node_1.x", value: 240 }]
+    });
+
+    expect(result).toEqual({
+      status: "rejected",
+      reason: "permission_denied:nodes.node_1.x"
+    });
+    expect(coordinator.getRoomVersion("permission_room")).toBe(0);
+    expect(coordinator.getRoomState("permission_room")).toEqual({
+      nodes: {
+        node_1: { id: "node_1", x: 100, label: "Start" }
+      },
+      edges: {}
+    });
+    expect(await store.getEvents("permission_room")).toEqual([]);
+  });
+
+  it("allows operations when a caller role matches a permission rule", async () => {
+    const { coordinator } = createCoordinator();
+    coordinator.definePermissions([
+      { path: "nodes.*.x", operations: ["set", "update"], roles: ["editor", "admin"] },
+      { path: "nodes.*.label", operations: ["set", "update", "text"], roles: ["viewer", "editor", "admin"] }
+    ]);
+    await coordinator.loadRoom("permission_allow_room", {
+      nodes: {
+        node_1: { id: "node_1", x: 100, label: "Start" }
+      }
+    });
+
+    const result = await coordinator.applyMutation({
+      roomId: "permission_allow_room",
+      userId: "editor_1",
+      roles: ["editor"],
+      clientId: "c1",
+      operationId: "op_1",
+      baseVersion: 0,
+      operations: [
+        { op: "set", path: "nodes.node_1.x", value: 240 },
+        { op: "text", path: "nodes.node_1.label", value: { index: 5, insert: " here" } }
+      ]
+    });
+
+    expect(result).toMatchObject({ status: "accepted", serverVersion: 1 });
+    expect(coordinator.getRoomState("permission_allow_room")).toEqual({
+      nodes: {
+        node_1: { id: "node_1", x: 240, label: "Start here" }
+      }
+    });
+  });
+
+  it("rejects an entire batch when any operation is unauthorized", async () => {
+    const { coordinator } = createCoordinator();
+    coordinator.definePermissions([
+      { path: "nodes.*.label", operations: ["set", "update", "text"], roles: ["viewer", "editor", "admin"] },
+      { path: "edges.*", roles: ["admin"] }
+    ]);
+    await coordinator.loadRoom("permission_batch_room", {
+      nodes: {
+        node_1: { id: "node_1", label: "Start" }
+      },
+      edges: {}
+    });
+
+    const result = await coordinator.applyMutation({
+      roomId: "permission_batch_room",
+      userId: "viewer_1",
+      roles: ["viewer"],
+      clientId: "c1",
+      operationId: "op_1",
+      baseVersion: 0,
+      operations: [
+        { op: "text", path: "nodes.node_1.label", value: { index: 5, insert: " here" } },
+        { op: "set", path: "edges.edge_1", value: { id: "edge_1", source: "node_1", target: "node_2" } }
+      ]
+    });
+
+    expect(result).toEqual({ status: "rejected", reason: "permission_denied:edges.edge_1" });
+    expect(coordinator.getRoomVersion("permission_batch_room")).toBe(0);
+    expect(coordinator.getRoomState("permission_batch_room")).toEqual({
+      nodes: {
+        node_1: { id: "node_1", label: "Start" }
+      },
+      edges: {}
+    });
+  });
+
+  it("supports room-local permission rules without locking down unrelated rooms", async () => {
+    const { coordinator } = createCoordinator();
+    coordinator.definePermissions("locked_room", [
+      { path: "nodes.*.x", operations: ["set", "update"], roles: ["admin"] }
+    ]);
+    await coordinator.loadRoom("locked_room", {
+      nodes: { node_1: { id: "node_1", x: 100 } }
+    });
+    await coordinator.loadRoom("open_room", {
+      nodes: { node_1: { id: "node_1", x: 100 } }
+    });
+
+    await expect(
+      coordinator.applyMutation({
+        roomId: "locked_room",
+        userId: "viewer_1",
+        roles: ["viewer"],
+        clientId: "c1",
+        operationId: "op_1",
+        baseVersion: 0,
+        operations: [{ op: "set", path: "nodes.node_1.x", value: 200 }]
+      })
+    ).resolves.toEqual({ status: "rejected", reason: "permission_denied:nodes.node_1.x" });
+
+    await expect(
+      coordinator.applyMutation({
+        roomId: "open_room",
+        userId: "viewer_1",
+        roles: ["viewer"],
+        clientId: "c1",
+        operationId: "op_2",
+        baseVersion: 0,
+        operations: [{ op: "set", path: "nodes.node_1.x", value: 200 }]
+      })
+    ).resolves.toMatchObject({ status: "accepted", serverVersion: 1 });
+  });
+
   it("uses custom field resolvers for stale concurrent updates", async () => {
     const { coordinator } = createCoordinator();
     await coordinator.loadRoom("project_123", {

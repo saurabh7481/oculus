@@ -91,14 +91,45 @@ button:hover {
   font-size: 13px;
 }
 
+.status span {
+  display: grid;
+  gap: 1px;
+  line-height: 1.1;
+}
+
+.status small {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.78;
+}
+
+.connected,
 .online {
   color: #047857;
   background: #ecfdf5;
 }
 
+.connecting,
+.reconnecting,
+.syncing {
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.reconnecting svg,
+.syncing svg {
+  animation: spin 1s linear infinite;
+}
+
 .offline {
   color: #b45309;
   background: #fffbeb;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .active {
