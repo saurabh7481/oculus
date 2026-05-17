@@ -34,11 +34,13 @@
     resize,
     linkDrag,
     previewState,
+    selectedEdgeId,
     onStartDrag,
     onStartResize,
     onRename,
     onStartLink,
-    onFocusLabel
+    onFocusLabel,
+    onSelectEdge
   }: {
     nodes: WorkflowNodeModel[];
     edges: WorkflowEdge[];
@@ -47,11 +49,13 @@
     resize: ResizeState | null;
     linkDrag: { sourceId: string; x: number; y: number } | null;
     previewState: boolean;
+    selectedEdgeId: string | null;
     onStartDrag: (event: PointerEvent, id: string, x: number, y: number) => void;
     onStartResize: (event: PointerEvent, id: string, handle: ResizeHandle, rect: Rect) => void;
     onRename: (id: string, field: "label", value: string) => void;
     onStartLink: (event: PointerEvent, sourceId: string) => void;
     onFocusLabel: (id: string) => void;
+    onSelectEdge: (id: string) => void;
   } = $props();
 
   function draftRect(
@@ -74,7 +78,7 @@
 </script>
 
 <div class="workflow-stage" data-testid="workflow-board">
-  <WorkflowEdgeLayer {edges} {nodes} {drag} {linkDrag} {resize} />
+  <WorkflowEdgeLayer {edges} {nodes} {drag} {linkDrag} {resize} {selectedEdgeId} {onSelectEdge} />
   {#each nodes as node (node.id)}
     <WorkflowNode
       {node}

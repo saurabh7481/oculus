@@ -798,6 +798,16 @@ button:not(:disabled):hover {
   stroke-dasharray: 8 6;
 }
 
+.edges text.edge-label {
+  font-size: 11px;
+  fill: #475569;
+  pointer-events: none;
+}
+
+.edges line.selected {
+  stroke: #2563eb;
+}
+
 .workflow-node {
   width: 166px;
   min-height: 68px;

@@ -48,8 +48,8 @@
   import type { WorkflowEdge, WorkflowNode } from "../workflow/workflow-model";
 
   type Environment = "whiteboard" | "design" | "workflow";
-  type SelectableKind = "shape" | "frame" | "node";
-  type CollectionName = "shapes" | "frames" | "nodes";
+  type SelectableKind = "shape" | "frame" | "node" | "edge";
+  type CollectionName = "shapes" | "frames" | "nodes" | "edges";
 
   type Point = { x: number; y: number };
 
@@ -260,6 +260,7 @@
   function collectionFor(kind: SelectableKind): CollectionName {
     if (kind === "shape") return "shapes";
     if (kind === "frame") return "frames";
+    if (kind === "edge") return "edges";
     return "nodes";
   }
 
@@ -681,6 +682,10 @@
       await room.transaction("Delete workflow node", operations, { kind: "delete", targetIds: [target.id] });
       return;
     }
+    if (target.kind === "edge") {
+      await room.transaction("Delete edge", [{ op: "delete", path: `edges.${target.id}` }], { kind: "delete", targetIds: [target.id] });
+      return;
+    }
     await room.transaction(
       `Delete ${target.kind}`,
       [{ op: "delete", path: `${collectionFor(target.kind)}.${target.id}` }],
@@ -691,6 +696,7 @@
   async function duplicateSelected() {
     if (!selected) return;
     const target = selected;
+    if (target.kind === "edge") return;
     const collection = collectionFor(target.kind);
     const source = visibleState[collection]?.[target.id];
     if (!source) return;
@@ -715,6 +721,14 @@
       "Recolor shape",
       [{ op: "set", path: `shapes.${selected.id}.color`, value: color }],
       { kind: "whiteboard", targetIds: [selected.id] }
+    );
+  }
+
+  async function relabelEdge(id: string, label: string) {
+    await room.transaction(
+      "Label edge",
+      [{ op: "set", path: `edges.${id}.label`, value: label }],
+      { kind: "workflow", targetIds: [id] }
     );
   }
 
@@ -1008,6 +1022,7 @@
             {resize}
             {linkDrag}
             previewState={Boolean(previewState)}
+            selectedEdgeId={selected?.kind === "edge" ? selected.id : null}
             onStartDrag={(event, id, x, y) => startDrag(event, "nodes", "node", id, x, y)}
             onStartResize={(event, id, handle, rect) => startResize(event, "nodes", "node", id, handle, rect)}
             onRename={(id, field, value) => void rename("nodes", id, field, value)}
@@ -1019,6 +1034,7 @@
                 name: userName,
                 color: userColor
               })}
+            onSelectEdge={(id) => select("edge", id)}
           />
         {/if}
       </div>
@@ -1054,6 +1070,23 @@
           <ColorPicker
             value={visibleState.shapes[selected.id].color}
             onchange={(color) => void recolor(color)}
+          />
+        </section>
+      {/if}
+
+      {#if selected?.kind === "edge" && visibleState.edges?.[selected.id]}
+        {@const edge = visibleState.edges[selected.id]}
+        <section>
+          <p class="eyebrow">Edge label</p>
+          <label for="edge-label-input" class="sr-only">Edge label</label>
+          <input
+            id="edge-label-input"
+            aria-label="Edge label"
+            type="text"
+            value={edge.label ?? ""}
+            placeholder="e.g. Approved"
+            on:blur={(e) => void relabelEdge(selected.id, e.currentTarget.value)}
+            on:keydown={(e) => { if (e.key === "Enter") { void relabelEdge(selected.id, (e.currentTarget as HTMLInputElement).value); (e.currentTarget as HTMLInputElement).blur(); } }}
           />
         </section>
       {/if}
