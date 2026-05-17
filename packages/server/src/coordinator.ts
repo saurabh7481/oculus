@@ -2,6 +2,7 @@ import {
   applyCrdtTextOperation,
   encodeCrdtTextState
 } from "./crdt";
+import type { z } from "zod";
 
 export type TextOperationValue = {
   index?: number;
@@ -106,6 +107,15 @@ export type PermissionContext = {
   roles: string[];
 };
 
+export type MutationMetadata = {
+  label?: string;
+  kind?: string;
+  targetIds?: string[];
+  inverseOperations?: Operation[];
+  undoOf?: string;
+  redoOf?: string;
+};
+
 export type RoomEvent = {
   roomId: string;
   userId: string;
@@ -114,6 +124,47 @@ export type RoomEvent = {
   version: number;
   operations: Operation[];
   timestamp: number;
+  metadata?: MutationMetadata;
+};
+
+export type ReplayDiffChange = {
+  path: string;
+  before: unknown;
+  after: unknown;
+  kind: "added" | "removed" | "changed";
+};
+
+export type ReplayDiff = {
+  roomId: string;
+  fromVersion: number;
+  toVersion: number;
+  fromState: Record<string, unknown>;
+  toState: Record<string, unknown>;
+  events: RoomEvent[];
+  changedPaths: string[];
+  changes: ReplayDiffChange[];
+};
+
+export type RoomCoordinatorOptions = {
+  snapshotInterval?: number;
+  snapshotRetention?: number;
+  idleRoomTtlMs?: number;
+};
+
+export type WorkflowEdgeValidatorConfig = {
+  edgeCollection: string;
+  nodeCollection: string;
+  sourceNodeField?: string;
+  targetNodeField?: string;
+  sourcePortField?: string;
+  targetPortField?: string;
+};
+
+export type RoomDefinition = {
+  collections?: Record<string, CollectionConfig>;
+  permissions?: PermissionRule[];
+  edgeValidators?: WorkflowEdgeValidatorConfig[];
+  schema?: z.ZodType<Record<string, unknown>>;
 };
 
 type RoomCacheEntry = {
@@ -137,6 +188,7 @@ export interface EventStore {
   saveSnapshot(roomId: string, version: number, state: Record<string, unknown>): Promise<void>;
   getCrdtTextStates(roomId: string, atOrBeforeVersion?: number): Promise<Map<string, number[]>>;
   saveCrdtTextStates(roomId: string, version: number, states: Map<string, number[]>): Promise<void>;
+  pruneSnapshots(roomId: string, keepLatest: number): Promise<void>;
 }
 
 export class MemoryEventStore implements EventStore {
@@ -158,14 +210,14 @@ export class MemoryEventStore implements EventStore {
 
   async appendEvent(event: RoomEvent): Promise<void> {
     const events = this.events.get(event.roomId) ?? [];
-    events.push({ ...event, operations: clone(event.operations) });
+    events.push({ ...event, operations: clone(event.operations), metadata: clone(event.metadata) });
     this.events.set(event.roomId, events);
   }
 
   async getEvents(roomId: string, afterVersion = 0): Promise<RoomEvent[]> {
     return (this.events.get(roomId) ?? [])
       .filter((event) => event.version > afterVersion)
-      .map((event) => ({ ...event, operations: clone(event.operations) }));
+      .map((event) => ({ ...event, operations: clone(event.operations), metadata: clone(event.metadata) }));
   }
 
   async getLatestSnapshot(
@@ -203,18 +255,51 @@ export class MemoryEventStore implements EventStore {
     snapshots.push({ version, states: cloneCrdtTextStates(states) });
     this.crdtTextStates.set(roomId, snapshots);
   }
+
+  async pruneSnapshots(roomId: string, keepLatest: number): Promise<void> {
+    const keep = normalizeSnapshotRetention(keepLatest);
+    const retainedVersions = (this.snapshots.get(roomId) ?? [])
+      .map((snapshot) => snapshot.version)
+      .sort((a, b) => b - a)
+      .slice(0, keep);
+    const retained = new Set(retainedVersions);
+
+    this.snapshots.set(
+      roomId,
+      (this.snapshots.get(roomId) ?? []).filter((snapshot) => retained.has(snapshot.version))
+    );
+    this.crdtTextStates.set(
+      roomId,
+      (this.crdtTextStates.get(roomId) ?? []).filter((snapshot) => retained.has(snapshot.version))
+    );
+  }
 }
 
 export class RoomCoordinator {
   private rooms = new Map<string, RoomCacheEntry>();
   private collectionConfigs = new Map<string, CollectionConfig>();
   private permissionRules = new Map<string, PermissionRule[]>();
+  private roomDefinitions = new Map<string, RoomDefinition>();
   private mutationQueues = new Map<string, Promise<void>>();
+  private readonly snapshotInterval: number;
+  private readonly snapshotRetention?: number;
+  private readonly idleRoomTtlMs?: number;
 
-  constructor(private readonly store: EventStore = new MemoryEventStore()) {}
+  constructor(
+    private readonly store: EventStore = new MemoryEventStore(),
+    options: RoomCoordinatorOptions = {}
+  ) {
+    this.snapshotInterval = normalizePositiveInteger(options.snapshotInterval, 100);
+    this.snapshotRetention = options.snapshotRetention;
+    this.idleRoomTtlMs = options.idleRoomTtlMs;
+  }
 
   defineCollection(name: string, config: CollectionConfig): void {
     this.collectionConfigs.set(name, config);
+  }
+
+  defineRoom(roomId: string, definition: RoomDefinition): void {
+    this.roomDefinitions.set(roomId, copyRoomDefinition(definition));
   }
 
   definePermissions(rules: PermissionRule[]): void;
@@ -282,6 +367,7 @@ export class RoomCoordinator {
     operationId: string;
     baseVersion: number;
     operations: Operation[];
+    metadata?: MutationMetadata;
   }): Promise<
     | {
         status: "accepted";
@@ -302,6 +388,7 @@ export class RoomCoordinator {
     operationId: string;
     baseVersion: number;
     operations: Operation[];
+    metadata?: MutationMetadata;
   }): Promise<
     | {
         status: "accepted";
@@ -325,6 +412,11 @@ export class RoomCoordinator {
       return { status: "rejected", reason: `permission_denied:${permissionDeniedPath}` };
     }
 
+    const validationError = this.getValidationError(params.roomId, room.state, params.operations);
+    if (validationError) {
+      return { status: "rejected", reason: `validation_failed:${validationError}` };
+    }
+
     const transformedOperations = this.transformOperations(
       params.operations,
       params.baseVersion,
@@ -341,6 +433,10 @@ export class RoomCoordinator {
       userId: params.userId,
       timestamp
     }, nextCrdtTextStates);
+    const schemaValidationError = this.getSchemaValidationError(params.roomId, nextState);
+    if (schemaValidationError) {
+      return { status: "rejected", reason: "schema_validation_failed" };
+    }
 
     try {
       await this.store.appendEvent({
@@ -350,7 +446,8 @@ export class RoomCoordinator {
         operationId: params.operationId,
         version: serverVersion,
         operations: transformedOperations,
-        timestamp
+        timestamp,
+        metadata: clone(params.metadata)
       });
     } catch {
       return { status: "rejected", reason: "event_persist_failed" };
@@ -361,7 +458,7 @@ export class RoomCoordinator {
     room.crdtTextStates = nextCrdtTextStates;
     room.lastAccess = timestamp;
 
-    if (serverVersion % 100 === 0) {
+    if (serverVersion % this.snapshotInterval === 0) {
       void this.saveRoomSnapshot(params.roomId, serverVersion, nextState, nextCrdtTextStates);
     }
 
@@ -403,6 +500,10 @@ export class RoomCoordinator {
     return this.rooms.get(roomId)?.version ?? 0;
   }
 
+  getLoadedRoomIds(): string[] {
+    return [...this.rooms.keys()].sort();
+  }
+
   getConnectedUsers(roomId: string): Array<{
     userId: string;
     clientId: string;
@@ -429,9 +530,34 @@ export class RoomCoordinator {
     if (!room) return;
 
     room.connectedClients.delete(clientId);
+    room.lastAccess = Date.now();
     if (room.connectedClients.size === 0) {
       await this.saveRoomSnapshot(roomId, room.version, room.state, room.crdtTextStates);
     }
+  }
+
+  async compactRoom(roomId: string): Promise<{ version: number; snapshotSaved: boolean } | undefined> {
+    const room = this.rooms.get(roomId);
+    if (!room) return undefined;
+    await this.saveRoomSnapshot(roomId, room.version, room.state, room.crdtTextStates);
+    room.lastAccess = Date.now();
+    return { version: room.version, snapshotSaved: true };
+  }
+
+  async collectIdleRooms(now = Date.now()): Promise<string[]> {
+    if (this.idleRoomTtlMs === undefined) return [];
+
+    const evicted: string[] = [];
+    for (const [roomId, room] of this.rooms.entries()) {
+      if (room.connectedClients.size > 0) continue;
+      if (now - room.lastAccess < this.idleRoomTtlMs) continue;
+
+      await this.saveRoomSnapshot(roomId, room.version, room.state, room.crdtTextStates);
+      this.rooms.delete(roomId);
+      evicted.push(roomId);
+    }
+
+    return evicted.sort();
   }
 
   updatePresence(roomId: string, clientId: string, data: Record<string, unknown>): void {
@@ -467,6 +593,27 @@ export class RoomCoordinator {
     return state;
   }
 
+  async diffVersions(roomId: string, fromVersion: number, toVersion: number): Promise<ReplayDiff> {
+    const lowerVersion = Math.min(fromVersion, toVersion);
+    const upperVersion = Math.max(fromVersion, toVersion);
+    const fromState = await this.replayAt(roomId, lowerVersion);
+    const toState = await this.replayAt(roomId, upperVersion);
+    const events = (await this.store.getEvents(roomId, lowerVersion))
+      .filter((event) => event.version <= upperVersion);
+    const changes = diffStates(fromState, toState);
+
+    return {
+      roomId,
+      fromVersion: lowerVersion,
+      toVersion: upperVersion,
+      fromState,
+      toState,
+      events,
+      changedPaths: changes.map((change) => change.path),
+      changes
+    };
+  }
+
   private transformOperations(
     operations: Operation[],
     _baseVersion: number,
@@ -493,7 +640,10 @@ export class RoomCoordinator {
   }
 
   private getPermissionRules(roomId: string): PermissionRule[] {
-    return this.permissionRules.get(roomId) ?? this.permissionRules.get("*") ?? [];
+    return this.permissionRules.get(roomId)
+      ?? this.roomDefinitions.get(roomId)?.permissions
+      ?? this.permissionRules.get("*")
+      ?? [];
   }
 
   private isOperationAllowed(operation: Operation, context: PermissionContext, rules: PermissionRule[]): boolean {
@@ -535,7 +685,7 @@ export class RoomCoordinator {
     }
 
     if (operation.op === "text") {
-      const strategy = this.getFieldStrategy(operation.path);
+      const strategy = this.getFieldStrategy(meta.roomId, operation.path);
       if (strategy?.strategy === "crdt-text") {
         const result = applyCrdtTextOperation(
           getPath(state, operation.path),
@@ -573,7 +723,7 @@ export class RoomCoordinator {
       );
     }
 
-    const strategy = this.getFieldStrategy(operation.path);
+    const strategy = this.getFieldStrategy(meta.roomId, operation.path);
     if (strategy?.strategy === "crdt-text") {
       crdtTextStates.set(operation.path, encodeCrdtTextState(operation.value));
     }
@@ -586,10 +736,47 @@ export class RoomCoordinator {
     return setPath(state, operation.path, operation.value);
   }
 
-  private getFieldStrategy(path: string): FieldStrategy | undefined {
+  private getFieldStrategy(roomId: string, path: string): FieldStrategy | undefined {
     const [collection, , field] = path.split(".");
     if (!collection || !field) return undefined;
-    return this.collectionConfigs.get(collection)?.fields?.[field];
+    return this.roomDefinitions.get(roomId)?.collections?.[collection]?.fields?.[field]
+      ?? this.collectionConfigs.get(collection)?.fields?.[field];
+  }
+
+  private getValidationError(
+    roomId: string,
+    state: Record<string, unknown>,
+    operations: Operation[]
+  ): string | undefined {
+    const definition = this.roomDefinitions.get(roomId);
+    if (!definition?.edgeValidators?.length) return undefined;
+    const edgeCollections = new Set(definition.edgeValidators.map((validator) => validator.edgeCollection));
+    const seedOperations = operations.filter((operation) => !isRootCollectionWrite(operation, edgeCollections));
+    const validationState = seedOperations.length > 0
+      ? this.applyOperations(state, seedOperations, {
+        roomId,
+        currentVersion: 0,
+        incomingVersion: 0,
+        userId: "validator",
+        timestamp: Date.now()
+      }, new Map())
+      : state;
+
+    for (const operation of operations) {
+      for (const validator of definition.edgeValidators) {
+        const error = validateWorkflowEdgeOperation(validationState, operation, validator);
+        if (error) return error;
+      }
+    }
+
+    return undefined;
+  }
+
+  private getSchemaValidationError(roomId: string, state: Record<string, unknown>): string | undefined {
+    const schema = this.roomDefinitions.get(roomId)?.schema;
+    if (!schema) return undefined;
+    const result = schema.safeParse(state);
+    return result.success ? undefined : result.error.message;
   }
 
   private async saveRoomSnapshot(
@@ -600,6 +787,9 @@ export class RoomCoordinator {
   ): Promise<void> {
     await this.store.saveSnapshot(roomId, version, state);
     await this.store.saveCrdtTextStates(roomId, version, crdtTextStates);
+    if (this.snapshotRetention !== undefined) {
+      await this.store.pruneSnapshots(roomId, this.snapshotRetention);
+    }
   }
 }
 
@@ -734,6 +924,129 @@ function matchesPathPattern(pattern: string, path: string): boolean {
   return patternParts.every((part, index) => part === "*" || part === pathParts[index]);
 }
 
+function validateWorkflowEdgeOperation(
+  state: Record<string, unknown>,
+  operation: Operation,
+  config: WorkflowEdgeValidatorConfig
+): string | undefined {
+  if (operation.op !== "set" && operation.op !== "insert" && operation.op !== "update") return undefined;
+
+  const [collection, edgeId] = operation.path.split(".");
+  if (collection !== config.edgeCollection || !edgeId || operation.path.split(".").length !== 2) {
+    return undefined;
+  }
+  if (!isRecord(operation.value)) return `${operation.path}.invalid_edge`;
+
+  const sourceNodeField = config.sourceNodeField ?? "sourceNodeId";
+  const targetNodeField = config.targetNodeField ?? "targetNodeId";
+  const sourcePortField = config.sourcePortField ?? "sourcePortId";
+  const targetPortField = config.targetPortField ?? "targetPortId";
+  const sourceNodeId = operation.value[sourceNodeField];
+  const targetNodeId = operation.value[targetNodeField];
+  if (typeof sourceNodeId !== "string") return `${operation.path}.source_node_missing`;
+  if (typeof targetNodeId !== "string") return `${operation.path}.target_node_missing`;
+
+  const sourceNode = getPath(state, `${config.nodeCollection}.${sourceNodeId}`);
+  const targetNode = getPath(state, `${config.nodeCollection}.${targetNodeId}`);
+  if (!isRecord(sourceNode)) return `${operation.path}.source_node_missing`;
+  if (!isRecord(targetNode)) return `${operation.path}.target_node_missing`;
+
+  const sourcePortId = operation.value[sourcePortField];
+  if (typeof sourcePortId === "string" && !hasPort(sourceNode, "outputs", sourcePortId)) {
+    return `${operation.path}.source_port_missing`;
+  }
+
+  const targetPortId = operation.value[targetPortField];
+  if (typeof targetPortId === "string" && !hasPort(targetNode, "inputs", targetPortId)) {
+    return `${operation.path}.target_port_missing`;
+  }
+
+  return undefined;
+}
+
+function isRootCollectionWrite(operation: Operation, collections: Set<string>): boolean {
+  if (operation.op !== "set" && operation.op !== "insert" && operation.op !== "update") return false;
+  const [collection, id, field] = operation.path.split(".");
+  return Boolean(collection && id && !field && collections.has(collection));
+}
+
+function copyRoomDefinition(definition: RoomDefinition): RoomDefinition {
+  return {
+    collections: Object.fromEntries(
+      Object.entries(definition.collections ?? {}).map(([name, config]) => [name, copyCollectionConfig(config)])
+    ),
+    permissions: definition.permissions?.map((rule) => ({
+      path: rule.path,
+      operations: rule.operations ? [...rule.operations] : undefined,
+      roles: [...rule.roles]
+    })),
+    edgeValidators: definition.edgeValidators?.map((validator) => ({ ...validator })),
+    schema: definition.schema
+  };
+}
+
+function copyCollectionConfig(config: CollectionConfig): CollectionConfig {
+  return {
+    fields: Object.fromEntries(
+      Object.entries(config.fields ?? {}).map(([field, strategy]) => [field, { ...strategy }])
+    )
+  };
+}
+
+function hasPort(node: Record<string, unknown>, direction: "inputs" | "outputs", portId: string): boolean {
+  const ports = node.ports;
+  if (!isRecord(ports)) return false;
+  const candidates = ports[direction];
+  return Array.isArray(candidates) && candidates.some((port) => isRecord(port) && port.id === portId);
+}
+
+function diffStates(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  path: string[] = []
+): ReplayDiffChange[] {
+  if (Object.is(before, after)) return [];
+
+  if (!isRecord(before) || !isRecord(after)) {
+    return [{
+      path: path.join("."),
+      before,
+      after,
+      kind: before === undefined ? "added" : after === undefined ? "removed" : "changed"
+    }];
+  }
+
+  const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+  return keys.flatMap((key) => {
+    const nextPath = [...path, key];
+    const beforeValue = before[key];
+    const afterValue = after[key];
+
+    if (Object.is(beforeValue, afterValue)) return [];
+    if (beforeValue === undefined || afterValue === undefined) {
+      return [{
+        path: nextPath.join("."),
+        before: beforeValue,
+        after: afterValue,
+        kind: beforeValue === undefined ? "added" : "removed"
+      }];
+    }
+    if (isRecord(beforeValue) && isRecord(afterValue)) {
+      return diffStates(beforeValue, afterValue, nextPath);
+    }
+    return [{
+      path: nextPath.join("."),
+      before: beforeValue,
+      after: afterValue,
+      kind: "changed"
+    }];
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function clampInteger(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(Math.max(Math.trunc(value), min), max);
@@ -745,4 +1058,12 @@ function clone<T>(value: T): T {
 
 function cloneCrdtTextStates(states: Map<string, number[]>): Map<string, number[]> {
   return new Map([...states.entries()].map(([path, state]) => [path, [...state]]));
+}
+
+function normalizeSnapshotRetention(keepLatest: number): number {
+  return Number.isFinite(keepLatest) ? Math.max(1, Math.trunc(keepLatest)) : 1;
+}
+
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) ? Math.max(1, Math.trunc(value as number)) : fallback;
 }

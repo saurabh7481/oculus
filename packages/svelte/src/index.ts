@@ -1,11 +1,16 @@
 import { derived, get, writable, type Readable } from "svelte/store";
 import type {
   ConnectionStatus,
+  CursorAwareness,
   OculusClient,
   PresenceUser,
+  ReplayDiff,
   RoomEvent,
   RoomOptions,
-  SyncState
+  SyncState,
+  TransactionOptions,
+  ViewportAwareness,
+  Operation
 } from "@oculus/sdk";
 
 export type CursorPresence = {
@@ -30,8 +35,21 @@ export type OculusRoomStore<S extends Record<string, unknown>> = {
   insert: (collection: string, id: string, data: Record<string, unknown>) => Promise<void>;
   update: (collection: string, id: string, data: Record<string, unknown>) => Promise<void>;
   remove: (collection: string, id: string) => Promise<void>;
+  transaction: (
+    label: string,
+    operations: Operation[],
+    options?: TransactionOptions
+  ) => Promise<void>;
+  undo: () => Promise<void>;
+  redo: () => Promise<void>;
+  updateCursor: (cursor: CursorAwareness, data?: { name?: string; color?: string }) => void;
+  updateViewport: (viewport: ViewportAwareness) => void;
+  updateSelection: (ids: string[]) => void;
+  updateTool: (tool: string | null) => void;
+  updateEditing: (path: string | null) => void;
   updatePresence: (data: Record<string, unknown>, options?: { throttle?: number }) => void;
   replayAt: (version: number) => Promise<S>;
+  diffVersions: (fromVersion: number, toVersion: number) => Promise<ReplayDiff<S>>;
   refreshEvents: () => Promise<void>;
   disconnect: () => void;
 };
@@ -122,8 +140,23 @@ export function createOculusRoomStore<S extends Record<string, unknown>>(
     remove: async (collection, id) => {
       await room.stateApi.collection(collection).delete(id);
     },
+    transaction: async (label, operations, options) => {
+      await room.transaction(label, operations, options);
+    },
+    undo: async () => {
+      await room.undo();
+    },
+    redo: async () => {
+      await room.redo();
+    },
+    updateCursor: (cursor, data) => room.awareness.updateCursor(cursor, data),
+    updateViewport: (viewport) => room.awareness.updateViewport(viewport),
+    updateSelection: (ids) => room.awareness.updateSelection(ids),
+    updateTool: (tool) => room.awareness.updateTool(tool),
+    updateEditing: (path) => room.awareness.updateEditing(path),
     updatePresence: (data, options) => room.presence.update(data, options),
     replayAt: (targetVersion) => room.replayAt(targetVersion),
+    diffVersions: (fromVersion, toVersion) => room.diffVersions(fromVersion, toVersion),
     refreshEvents,
     disconnect: () => {
       connected.set(false);

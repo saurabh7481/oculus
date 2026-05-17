@@ -13,9 +13,11 @@ import {
 } from "../src/index";
 
 const originalWebSocket = globalThis.WebSocket;
+const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.WebSocket = originalWebSocket;
+  globalThis.fetch = originalFetch;
   FakeWebSocket.instances = [];
 });
 
@@ -31,6 +33,10 @@ type WorkflowState = {
   nodes?: Record<string, WorkflowNode>;
   layers?: string[];
   tree?: Record<string, { id: string; parentId?: string | null; children: string[] }>;
+  edges?: Record<string, { id: string; sourceNodeId: string; targetNodeId: string }>;
+  comments?: Record<string, unknown>;
+  assets?: Record<string, unknown>;
+  shapes?: Record<string, unknown>;
 };
 
 describe("SDK operation helpers", () => {
@@ -239,6 +245,225 @@ describe("developer-friendly room API", () => {
     expect(room.getState()).toEqual({
       nodes: {
         node_1: { id: "node_1", x: 120, y: 160, label: "Renamed" }
+      }
+    });
+  });
+
+  it("fetches replay diffs between room versions", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("http://localhost:3000/rooms/workflow_123/diff/1/3");
+      return new Response(
+        JSON.stringify({
+          diff: {
+            roomId: "workflow_123",
+            fromVersion: 1,
+            toVersion: 3,
+            changedPaths: ["nodes.node_1.x"],
+            changes: [{ path: "nodes.node_1.x", before: 10, after: 30, kind: "changed" }],
+            events: []
+          }
+        })
+      );
+    }) as typeof fetch;
+    const room = createClient({ serverUrl: "http://localhost:3000" }).room<WorkflowState>("workflow_123");
+
+    await expect(room.diffVersions(1, 3)).resolves.toEqual({
+      roomId: "workflow_123",
+      fromVersion: 1,
+      toVersion: 3,
+      changedPaths: ["nodes.node_1.x"],
+      changes: [{ path: "nodes.node_1.x", before: 10, after: 30, kind: "changed" }],
+      events: []
+    });
+  });
+
+  it("groups multi-object edits into labeled reversible transactions", async () => {
+    const room = createClient({ serverUrl: "http://localhost:3000", userId: "user_1" }).room<WorkflowState>(
+      "workflow_123"
+    );
+    const nodes = room.collection<WorkflowNode>("nodes");
+    await nodes.create("node_1", { id: "node_1", x: 10, y: 10, label: "One" });
+    await nodes.create("node_2", { id: "node_2", x: 20, y: 20, label: "Two" });
+
+    await room.transaction("Move selected nodes", (tx) => {
+      tx.collection<WorkflowNode>("nodes").change("node_1", { x: 110, y: 120 });
+      tx.collection<WorkflowNode>("nodes").change("node_2", { x: 220, y: 240 });
+    }, { kind: "move", targetIds: ["node_1", "node_2"] });
+
+    expect(room.getState().nodes).toMatchObject({
+      node_1: { x: 110, y: 120 },
+      node_2: { x: 220, y: 240 }
+    });
+    expect(room.canUndo()).toBe(true);
+
+    await room.undo();
+    expect(room.getState().nodes).toMatchObject({
+      node_1: { x: 10, y: 10 },
+      node_2: { x: 20, y: 20 }
+    });
+    expect(room.canRedo()).toBe(true);
+
+    await room.redo();
+    expect(room.getState().nodes).toMatchObject({
+      node_1: { x: 110, y: 120 },
+      node_2: { x: 220, y: 240 }
+    });
+  });
+
+  it("sends transaction metadata with connected mutations", async () => {
+    installFakeWebSocket();
+    const room = createClient({ serverUrl: "http://localhost:3000", userId: "user_1" }).room<WorkflowState>(
+      "workflow_123"
+    );
+    const connected = room.connect();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    socket.message({ type: "room_init", version: 1, state: { nodes: {} }, connectedUsers: [] });
+    await connected;
+
+    const pending = room.transaction("Add node", [
+      { op: "set", path: "nodes.node_1", value: { id: "node_1", x: 10, y: 20, label: "Start" } }
+    ], { kind: "create", targetIds: ["node_1"] });
+    await waitFor(() => socket.sent.length === 1);
+    const message = JSON.parse(socket.sent[0]!) as {
+      operationId: string;
+      metadata?: { label?: string; kind?: string; targetIds?: string[]; inverseOperations?: Operation[] };
+    };
+
+    expect(message.metadata).toMatchObject({
+      label: "Add node",
+      kind: "create",
+      targetIds: ["node_1"]
+    });
+    expect(message.metadata?.inverseOperations).toEqual([{ op: "delete", path: "nodes.node_1" }]);
+
+    socket.message({
+      type: "mutation_ack",
+      operationId: message.operationId,
+      serverVersion: 2,
+      status: "accepted"
+    });
+    await pending;
+  });
+
+  it("provides typed awareness helpers over presence", async () => {
+    installFakeWebSocket();
+    const room = createClient({ serverUrl: "http://localhost:3000", userId: "user_1" }).room<WorkflowState>(
+      "workflow_123"
+    );
+    const connected = room.connect();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    socket.message({ type: "room_init", version: 1, state: {}, connectedUsers: [] });
+    await connected;
+
+    room.awareness.updateCursor({ x: 12, y: 34 }, { name: "Ada", color: "#2563eb" });
+    room.awareness.updateViewport({ x: 0, y: 0, zoom: 1.5, pageId: "page_1" });
+    room.awareness.updateSelection(["node_1", "node_2"]);
+    room.awareness.updateTool("connector");
+    room.awareness.updateEditing("nodes.node_1.label");
+
+    expect(socket.sent.map((raw) => JSON.parse(raw))).toEqual([
+      {
+        type: "presence",
+        data: {
+          cursor: { x: 12, y: 34 },
+          name: "Ada",
+          color: "#2563eb"
+        }
+      },
+      {
+        type: "presence",
+        data: {
+          viewport: { x: 0, y: 0, zoom: 1.5, pageId: "page_1" }
+        }
+      },
+      { type: "presence", data: { selection: { ids: ["node_1", "node_2"] } } },
+      { type: "presence", data: { tool: "connector" } },
+      { type: "presence", data: { editing: "nodes.node_1.label" } }
+    ]);
+  });
+
+  it("provides comments, asset references, and canvas shape helpers", async () => {
+    const room = createClient({ serverUrl: "http://localhost:3000", userId: "ada" }).room<WorkflowState>(
+      "canvas_123"
+    );
+
+    await room.comments("comments").create("comment_1", {
+      targetId: "shape_1",
+      body: "Check the CTA alignment"
+    });
+    await room.comments("comments").reply("comment_1", "comment_2", {
+      body: "Aligned in the next pass"
+    });
+    await room.comments("comments").resolve("comment_1");
+
+    await room.assets("assets").create("asset_1", {
+      kind: "image",
+      url: "https://assets.example/hero.png",
+      width: 1200,
+      height: 800,
+      metadata: { alt: "Hero image" }
+    });
+
+    await room.shapes("shapes").create("shape_1", {
+      type: "rectangle",
+      x: 10,
+      y: 20,
+      width: 100,
+      height: 60,
+      style: { fill: "#ffffff" }
+    });
+    await room.shapes("shapes").move("shape_1", 80, 90);
+    await room.shapes("shapes").resize("shape_1", 240, 120);
+    await room.shapes("shapes").freehand("stroke_1", {
+      points: [{ x: 0, y: 0 }, { x: 4, y: 8 }],
+      style: { stroke: "#111827", strokeWidth: 2 }
+    });
+
+    expect(room.getState()).toMatchObject({
+      comments: {
+        comment_1: {
+          id: "comment_1",
+          targetId: "shape_1",
+          body: "Check the CTA alignment",
+          resolved: true,
+          authorId: "ada"
+        },
+        comment_2: {
+          id: "comment_2",
+          parentId: "comment_1",
+          body: "Aligned in the next pass",
+          resolved: false,
+          authorId: "ada"
+        }
+      },
+      assets: {
+        asset_1: {
+          id: "asset_1",
+          kind: "image",
+          url: "https://assets.example/hero.png",
+          width: 1200,
+          height: 800,
+          metadata: { alt: "Hero image" }
+        }
+      },
+      shapes: {
+        shape_1: {
+          id: "shape_1",
+          type: "rectangle",
+          x: 80,
+          y: 90,
+          width: 240,
+          height: 120,
+          style: { fill: "#ffffff" }
+        },
+        stroke_1: {
+          id: "stroke_1",
+          type: "freehand",
+          points: [{ x: 0, y: 0 }, { x: 4, y: 8 }],
+          style: { stroke: "#111827", strokeWidth: 2 }
+        }
       }
     });
   });

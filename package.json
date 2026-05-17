@@ -13,11 +13,13 @@
     "dev": "bun run --workspaces --filter '*' dev",
     "build": "bun run --filter @oculus/sdk build && bun run --filter @oculus/svelte build && bun run --filter @oculus/server build && bun run --filter @oculus/demo build",
     "test": "vitest run",
+    "test:e2e": "playwright test",
     "typecheck": "tsc -b packages/server packages/sdk packages/svelte apps/demo",
     "server": "bun run --filter @oculus/server dev",
     "demo": "bun run --filter @oculus/demo dev"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@types/bun": "^1.2.23",
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",

@@ -6,6 +6,7 @@ import {
   type RoomEvent,
   type Operation
 } from "../src/coordinator";
+import { z } from "zod";
 
 const createCoordinator = () => {
   const store = new MemoryEventStore();
@@ -76,6 +77,43 @@ describe("RoomCoordinator", () => {
       }
     });
     expect(await store.getEvents("workflow_123", 0)).toHaveLength(2);
+  });
+
+  it("stores transaction metadata with room events", async () => {
+    const { coordinator, store } = createCoordinator();
+    await coordinator.loadRoom("metadata_room", { nodes: {} });
+
+    await coordinator.applyMutation({
+      roomId: "metadata_room",
+      userId: "u1",
+      clientId: "c1",
+      operationId: "op_1",
+      baseVersion: 0,
+      metadata: {
+        label: "Move selected nodes",
+        kind: "move",
+        targetIds: ["node_1", "node_2"],
+        inverseOperations: [
+          { op: "set", path: "nodes.node_1.x", value: 10 },
+          { op: "set", path: "nodes.node_2.x", value: 20 }
+        ]
+      },
+      operations: [
+        { op: "set", path: "nodes.node_1.x", value: 110 },
+        { op: "set", path: "nodes.node_2.x", value: 220 }
+      ]
+    });
+
+    expect(await store.getEvents("metadata_room")).toMatchObject([
+      {
+        operationId: "op_1",
+        metadata: {
+          label: "Move selected nodes",
+          kind: "move",
+          targetIds: ["node_1", "node_2"]
+        }
+      }
+    ]);
   });
 
   it("serializes concurrent mutations so versions stay unique and ordered", async () => {
@@ -262,6 +300,197 @@ describe("RoomCoordinator", () => {
       },
       edges: {}
     });
+  });
+
+  it("applies reusable room configuration with collections, permissions, and edge validation", async () => {
+    const store = new MemoryEventStore();
+    const coordinator = new RoomCoordinator(store);
+    coordinator.defineRoom("workflow_room", {
+      collections: {
+        nodes: {
+          fields: {
+            label: { strategy: "crdt-text" }
+          }
+        }
+      },
+      permissions: [
+        { path: "nodes.*", operations: ["set"], roles: ["editor"] },
+        { path: "edges.*", operations: ["set"], roles: ["editor"] }
+      ],
+      edgeValidators: [
+        {
+          edgeCollection: "edges",
+          nodeCollection: "nodes",
+          sourceNodeField: "sourceNodeId",
+          targetNodeField: "targetNodeId",
+          sourcePortField: "sourcePortId",
+          targetPortField: "targetPortId"
+        }
+      ]
+    });
+    await coordinator.loadRoom("workflow_room", {
+      nodes: {
+        http: {
+          id: "http",
+          label: "HTTP",
+          ports: { outputs: [{ id: "response" }], inputs: [] }
+        },
+        ai: {
+          id: "ai",
+          label: "AI",
+          ports: { inputs: [{ id: "prompt" }], outputs: [] }
+        }
+      },
+      edges: {}
+    });
+
+    await expect(
+      coordinator.applyMutation({
+        roomId: "workflow_room",
+        userId: "u1",
+        roles: ["viewer"],
+        clientId: "c1",
+        operationId: "op_1",
+        baseVersion: 0,
+        operations: [{ op: "set", path: "nodes.http.label", value: "Blocked" }]
+      })
+    ).resolves.toEqual({ status: "rejected", reason: "permission_denied:nodes.http.label" });
+
+    await expect(
+      coordinator.applyMutation({
+        roomId: "workflow_room",
+        userId: "u1",
+        roles: ["editor"],
+        clientId: "c1",
+        operationId: "op_2",
+        baseVersion: 0,
+        operations: [
+          {
+            op: "set",
+            path: "edges.edge_1",
+            value: {
+              id: "edge_1",
+              sourceNodeId: "http",
+              sourcePortId: "missing",
+              targetNodeId: "ai",
+              targetPortId: "prompt"
+            }
+          }
+        ]
+      })
+    ).resolves.toEqual({
+      status: "rejected",
+      reason: "validation_failed:edges.edge_1.source_port_missing"
+    });
+
+    await expect(
+      coordinator.applyMutation({
+        roomId: "workflow_room",
+        userId: "u1",
+        roles: ["editor"],
+        clientId: "c1",
+        operationId: "op_3",
+        baseVersion: 0,
+        operations: [
+          {
+            op: "set",
+            path: "edges.edge_1",
+            value: {
+              id: "edge_1",
+              sourceNodeId: "http",
+              sourcePortId: "response",
+              targetNodeId: "ai",
+              targetPortId: "prompt"
+            }
+          }
+        ]
+      })
+    ).resolves.toMatchObject({ status: "accepted", serverVersion: 1 });
+
+    await expect(
+      coordinator.applyMutation({
+        roomId: "workflow_room",
+        userId: "u1",
+        roles: ["editor"],
+        clientId: "c1",
+        operationId: "op_4",
+        baseVersion: 1,
+        operations: [
+          {
+            op: "set",
+            path: "nodes.logger",
+            value: {
+              id: "logger",
+              label: "Logger",
+              ports: { inputs: [{ id: "input" }], outputs: [] }
+            }
+          },
+          {
+            op: "set",
+            path: "edges.edge_2",
+            value: {
+              id: "edge_2",
+              sourceNodeId: "http",
+              sourcePortId: "response",
+              targetNodeId: "logger",
+              targetPortId: "input"
+            }
+          }
+        ]
+      })
+    ).resolves.toMatchObject({ status: "accepted", serverVersion: 2 });
+  });
+
+  it("rejects mutations that fail server-side room schema validation", async () => {
+    const { coordinator, store } = createCoordinator();
+    coordinator.defineRoom("schema_room", {
+      schema: z.object({
+        nodes: z.record(z.object({
+          id: z.string(),
+          x: z.number(),
+          y: z.number(),
+          label: z.string()
+        }))
+      })
+    });
+    await coordinator.loadRoom("schema_room", { nodes: {} });
+
+    await expect(
+      coordinator.applyMutation({
+        roomId: "schema_room",
+        userId: "u1",
+        clientId: "c1",
+        operationId: "op_1",
+        baseVersion: 0,
+        operations: [
+          {
+            op: "set",
+            path: "nodes.node_1",
+            value: { id: "node_1", x: 10, y: 20, label: "Start" }
+          }
+        ]
+      })
+    ).resolves.toMatchObject({ status: "accepted", serverVersion: 1 });
+
+    await expect(
+      coordinator.applyMutation({
+        roomId: "schema_room",
+        userId: "u1",
+        clientId: "c1",
+        operationId: "op_2",
+        baseVersion: 1,
+        operations: [{ op: "set", path: "nodes.node_1.x", value: "invalid" }]
+      })
+    ).resolves.toEqual({
+      status: "rejected",
+      reason: "schema_validation_failed"
+    });
+    expect(coordinator.getRoomState("schema_room")).toEqual({
+      nodes: {
+        node_1: { id: "node_1", x: 10, y: 20, label: "Start" }
+      }
+    });
+    expect(await store.getEvents("schema_room")).toHaveLength(1);
   });
 
   it("supports room-local permission rules without locking down unrelated rooms", async () => {
@@ -601,6 +830,106 @@ describe("RoomCoordinator", () => {
     expect(await coordinator.replayAt("replay_room", 3)).toEqual({
       nodes: {}
     });
+  });
+
+  it("diffs room state between replay versions with event details", async () => {
+    const { coordinator } = createCoordinator();
+    await coordinator.loadRoom("diff_room", { nodes: {} });
+
+    await coordinator.applyMutation({
+      roomId: "diff_room",
+      userId: "u1",
+      clientId: "c1",
+      operationId: "op_1",
+      baseVersion: 0,
+      operations: [
+        {
+          op: "insert",
+          path: "nodes.node_1",
+          value: { id: "node_1", x: 10, y: 20, label: "Start" }
+        }
+      ]
+    });
+    await coordinator.applyMutation({
+      roomId: "diff_room",
+      userId: "u2",
+      clientId: "c2",
+      operationId: "op_2",
+      baseVersion: 1,
+      operations: [{ op: "update", path: "nodes.node_1.x", value: 30 }]
+    });
+    await coordinator.applyMutation({
+      roomId: "diff_room",
+      userId: "u3",
+      clientId: "c3",
+      operationId: "op_3",
+      baseVersion: 2,
+      operations: [{ op: "text", path: "nodes.node_1.label", value: { index: 5, insert: " here" } }]
+    });
+
+    const diff = await coordinator.diffVersions("diff_room", 1, 3);
+
+    expect(diff).toMatchObject({
+      roomId: "diff_room",
+      fromVersion: 1,
+      toVersion: 3,
+      changedPaths: ["nodes.node_1.label", "nodes.node_1.x"],
+      events: [
+        { version: 2, userId: "u2", operationId: "op_2" },
+        { version: 3, userId: "u3", operationId: "op_3" }
+      ],
+      changes: [
+        { path: "nodes.node_1.label", before: "Start", after: "Start here", kind: "changed" },
+        { path: "nodes.node_1.x", before: 10, after: 30, kind: "changed" }
+      ]
+    });
+  });
+
+  it("compacts snapshots using the configured interval and retention", async () => {
+    const store = new MemoryEventStore();
+    const coordinator = new RoomCoordinator(store, {
+      snapshotInterval: 2,
+      snapshotRetention: 1
+    });
+    await coordinator.loadRoom("compact_policy_room", { nodes: {} });
+
+    for (let version = 0; version < 4; version++) {
+      await coordinator.applyMutation({
+        roomId: "compact_policy_room",
+        userId: "u1",
+        clientId: "c1",
+        operationId: `op_${version + 1}`,
+        baseVersion: version,
+        operations: [{ op: "set", path: "nodes.node_1.x", value: version + 1 }]
+      });
+    }
+
+    expect(await store.getLatestSnapshot("compact_policy_room", 4)).toMatchObject({ version: 4 });
+    expect(await store.getLatestSnapshot("compact_policy_room", 2)).toBeUndefined();
+  });
+
+  it("evicts idle rooms after saving their latest snapshot", async () => {
+    const store = new MemoryEventStore();
+    const coordinator = new RoomCoordinator(store, { idleRoomTtlMs: 10 });
+    await coordinator.loadRoom("idle_room", { nodes: {} });
+    await coordinator.applyMutation({
+      roomId: "idle_room",
+      userId: "u1",
+      clientId: "c1",
+      operationId: "op_1",
+      baseVersion: 0,
+      operations: [{ op: "set", path: "nodes.node_1", value: { id: "node_1", x: 1 } }]
+    });
+
+    coordinator.onClientJoin("idle_room", "u1", "c1");
+    await coordinator.onClientLeave("idle_room", "c1");
+
+    const evicted = await coordinator.collectIdleRooms(Date.now() + 11);
+
+    expect(evicted).toEqual(["idle_room"]);
+    expect(coordinator.getLoadedRoomIds()).toEqual([]);
+    expect(coordinator.getRoomState("idle_room")).toBeUndefined();
+    expect(await store.getLatestSnapshot("idle_room")).toMatchObject({ version: 1 });
   });
 
   it("loads a room from the latest durable snapshot and replays newer events", async () => {

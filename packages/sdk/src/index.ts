@@ -89,7 +89,7 @@ export type TreeMoveOptions = {
 };
 
 type RoomMutationApi = {
-  apply(operations: Operation[]): Promise<unknown>;
+  apply(operations: Operation[], options?: ApplyOptions): Promise<unknown>;
   presence: {
     lock(path: string): Promise<{ acquired: boolean; release: () => Promise<unknown> }>;
   };
@@ -103,6 +103,101 @@ export type RoomEvent = {
   version: number;
   operations: Operation[];
   timestamp: number;
+  metadata?: MutationMetadata;
+};
+
+export type MutationMetadata = {
+  label?: string;
+  kind?: string;
+  targetIds?: string[];
+  inverseOperations?: Operation[];
+  undoOf?: string;
+  redoOf?: string;
+};
+
+export type ApplyOptions = {
+  metadata?: MutationMetadata;
+  trackUndo?: boolean;
+};
+
+export type TransactionOptions = Omit<MutationMetadata, "label" | "inverseOperations"> & {
+  trackUndo?: boolean;
+};
+
+export type CursorAwareness = {
+  x: number;
+  y: number;
+};
+
+export type ViewportAwareness = {
+  x: number;
+  y: number;
+  zoom: number;
+  pageId?: string;
+};
+
+export type CommentTarget = {
+  targetId?: string;
+  x?: number;
+  y?: number;
+  path?: string;
+};
+
+export type OculusComment = CommentTarget & {
+  id: string;
+  body: string;
+  authorId?: string;
+  parentId?: string;
+  resolved: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type AssetReference = {
+  id: string;
+  kind: "image" | "font" | "file" | "video" | "audio" | "other";
+  url: string;
+  width?: number;
+  height?: number;
+  mimeType?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type CanvasPoint = {
+  x: number;
+  y: number;
+};
+
+export type CanvasShape = {
+  id: string;
+  type: "rectangle" | "ellipse" | "sticky" | "text" | "frame" | "image" | "freehand" | string;
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  rotation?: number;
+  text?: string;
+  assetId?: string;
+  points?: CanvasPoint[];
+  style?: Record<string, unknown>;
+};
+
+export type ReplayDiffChange = {
+  path: string;
+  before: unknown;
+  after: unknown;
+  kind: "added" | "removed" | "changed";
+};
+
+export type ReplayDiff<S = Record<string, unknown>> = {
+  roomId: string;
+  fromVersion: number;
+  toVersion: number;
+  fromState?: S;
+  toState?: S;
+  events: RoomEvent[];
+  changedPaths: string[];
+  changes: ReplayDiffChange[];
 };
 
 export type OculusClientOptions = {
@@ -203,11 +298,14 @@ export class OculusRoom<S = Record<string, unknown>> {
     {
       operations: Operation[];
       previousState: S;
+      metadata?: MutationMetadata;
       resolve: (value: unknown) => void;
       reject: (reason?: unknown) => void;
     }
   >();
-  private offlineQueue: Operation[][] = [];
+  private offlineQueue: Array<{ operations: Operation[]; metadata?: MutationMetadata }> = [];
+  private undoStack: Array<{ label: string; operations: Operation[]; inverseOperations: Operation[] }> = [];
+  private redoStack: Array<{ label: string; operations: Operation[]; inverseOperations: Operation[] }> = [];
   private handlers = new Map<string, Set<Handler>>();
   private lastPresenceSend = 0;
   private presenceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -238,6 +336,18 @@ export class OculusRoom<S = Record<string, unknown>> {
 
   tree(path: string): OculusTree {
     return new OculusTree(this, path);
+  }
+
+  comments(name = "comments"): OculusComments {
+    return new OculusComments(this, name, () => this.clientOptions.userId ?? this.clientId);
+  }
+
+  assets(name = "assets"): OculusAssets {
+    return new OculusAssets(this, name);
+  }
+
+  shapes(name = "shapes"): OculusShapes {
+    return new OculusShapes(this, name);
   }
 
   readonly stateApi = {
@@ -279,8 +389,90 @@ export class OculusRoom<S = Record<string, unknown>> {
     }
   };
 
-  async apply(operations: Operation[]): Promise<unknown> {
-    return this.mutate(operations);
+  readonly awareness = {
+    updateCursor: (cursor: CursorAwareness, data: { name?: string; color?: string } = {}) => {
+      this.presence.update({ cursor, ...data }, { throttle: 0 });
+    },
+    updateViewport: (viewport: ViewportAwareness) => {
+      this.presence.update({ viewport }, { throttle: 0 });
+    },
+    updateSelection: (ids: string[]) => {
+      this.presence.update({ selection: { ids: [...ids] } }, { throttle: 0 });
+    },
+    updateTool: (tool: string | null) => {
+      this.presence.update({ tool }, { throttle: 0 });
+    },
+    updateEditing: (path: string | null) => {
+      this.presence.update({ editing: path }, { throttle: 0 });
+    }
+  };
+
+  async apply(operations: Operation[], options?: ApplyOptions): Promise<unknown> {
+    return this.mutate(operations, options);
+  }
+
+  async transaction(
+    label: string,
+    build: Operation[] | ((transaction: OculusTransaction) => void | Promise<void>),
+    options: TransactionOptions = {}
+  ): Promise<unknown> {
+    const transaction = new OculusTransaction();
+    if (Array.isArray(build)) {
+      transaction.apply(build);
+    } else {
+      await build(transaction);
+    }
+    const operations = transaction.getOperations();
+    return this.mutate(operations, {
+      trackUndo: options.trackUndo ?? true,
+      metadata: {
+        label,
+        kind: options.kind,
+        targetIds: options.targetIds,
+        undoOf: options.undoOf,
+        redoOf: options.redoOf
+      }
+    });
+  }
+
+  canUndo(): boolean {
+    return this.undoStack.length > 0;
+  }
+
+  canRedo(): boolean {
+    return this.redoStack.length > 0;
+  }
+
+  async undo(): Promise<unknown> {
+    const entry = this.undoStack.pop();
+    if (!entry) return { status: "empty" };
+    const result = await this.mutate(entry.inverseOperations, {
+      trackUndo: false,
+      metadata: {
+        label: `Undo ${entry.label}`,
+        kind: "undo",
+        undoOf: entry.label,
+        inverseOperations: entry.operations
+      }
+    });
+    this.redoStack.push(entry);
+    return result;
+  }
+
+  async redo(): Promise<unknown> {
+    const entry = this.redoStack.pop();
+    if (!entry) return { status: "empty" };
+    const result = await this.mutate(entry.operations, {
+      trackUndo: false,
+      metadata: {
+        label: `Redo ${entry.label}`,
+        kind: "redo",
+        redoOf: entry.label,
+        inverseOperations: entry.inverseOperations
+      }
+    });
+    this.undoStack.push(entry);
+    return result;
   }
 
   async connect(): Promise<void> {
@@ -395,28 +587,51 @@ export class OculusRoom<S = Record<string, unknown>> {
     return payload.state;
   }
 
-  private async mutate(operations: Operation[]): Promise<unknown> {
+  async diffVersions(fromVersion: number, toVersion: number): Promise<ReplayDiff<S>> {
+    const response = await fetch(
+      `${this.getHttpUrl()}/rooms/${encodeURIComponent(this.roomId)}/diff/${fromVersion}/${toVersion}`
+    );
+    const payload = (await response.json()) as { diff: ReplayDiff<S> };
+    return payload.diff;
+  }
+
+  private async mutate(operations: Operation[], options: ApplyOptions = {}): Promise<unknown> {
     this.validateOperations(operations);
     const previousState = this.getState();
+    const inverseOperations = createInverseOperations(previousState as Record<string, unknown>, operations);
+    const metadata = {
+      ...options.metadata,
+      inverseOperations: options.metadata?.inverseOperations ?? inverseOperations
+    };
     this.state = applyOperations(this.state as Record<string, unknown>, operations) as S;
     this.emit("state_change", this.getState());
 
+    if (options.trackUndo && inverseOperations.length > 0) {
+      this.undoStack.push({
+        label: metadata.label ?? "Change",
+        operations: clone(operations),
+        inverseOperations
+      });
+      this.redoStack = [];
+    }
+
     if (!this.connected || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      this.offlineQueue.push(operations);
+      this.offlineQueue.push({ operations, metadata });
       this.emitSyncState();
       return { status: "queued" };
     }
 
     const operationId = randomId();
     return new Promise((resolve, reject) => {
-      this.pending.set(operationId, { operations, previousState, resolve, reject });
+      this.pending.set(operationId, { operations, previousState, metadata, resolve, reject });
       this.emitSyncState();
       this.socket?.send(
         JSON.stringify({
           type: "mutation",
           operationId,
           baseVersion: this.version,
-          operations
+          operations,
+          metadata
         })
       );
 
@@ -484,8 +699,11 @@ export class OculusRoom<S = Record<string, unknown>> {
     this.offlineQueue = [];
     this.flushingQueueCount = queued.length;
     this.emitSyncState();
-    for (const operations of queued) {
-      await this.mutate(operations);
+    for (const queuedMutation of queued) {
+      await this.mutate(queuedMutation.operations, {
+        metadata: queuedMutation.metadata,
+        trackUndo: false
+      });
       this.flushingQueueCount -= 1;
       this.emitSyncState();
     }
@@ -564,6 +782,41 @@ export class OculusRoom<S = Record<string, unknown>> {
 
   private emitSyncState(): void {
     this.emit("sync_state_change", this.getSyncState());
+  }
+}
+
+export class OculusTransaction implements RoomMutationApi {
+  private operations: Operation[] = [];
+
+  readonly presence = {
+    lock: async (_path: string) => {
+      throw new Error("Locks cannot be acquired inside a transaction builder");
+    }
+  };
+
+  apply(operations: Operation[]): Promise<unknown> {
+    this.operations.push(...clone(operations));
+    return Promise.resolve({ status: "staged" });
+  }
+
+  collection<T extends Record<string, unknown> = Record<string, unknown>>(name: string): OculusCollection<T> {
+    return new OculusCollection(this, name, () => "transaction");
+  }
+
+  items<T extends Record<string, unknown> = Record<string, unknown>>(name: string): OculusCollection<T> {
+    return this.collection<T>(name);
+  }
+
+  list(path: string): OculusList {
+    return new OculusList(this, path);
+  }
+
+  tree(path: string): OculusTree {
+    return new OculusTree(this, path);
+  }
+
+  getOperations(): Operation[] {
+    return clone(this.operations);
   }
 }
 
@@ -653,6 +906,112 @@ export class OculusTree {
   }
 }
 
+export class OculusComments {
+  constructor(
+    private readonly room: Pick<RoomMutationApi, "apply">,
+    private readonly name: string,
+    private readonly getActorId: () => string
+  ) {}
+
+  create(
+    id: string,
+    data: CommentTarget & { body: string; parentId?: string; resolved?: boolean; createdAt?: number; updatedAt?: number }
+  ): Promise<unknown> {
+    const timestamp = data.createdAt ?? Date.now();
+    return this.room.apply([
+      {
+        op: "set",
+        path: `${this.name}.${id}`,
+        value: {
+          ...data,
+          id,
+          authorId: this.getActorId(),
+          resolved: data.resolved ?? false,
+          createdAt: timestamp,
+          updatedAt: data.updatedAt ?? timestamp
+        }
+      }
+    ]);
+  }
+
+  reply(parentId: string, id: string, data: { body: string; createdAt?: number; updatedAt?: number }): Promise<unknown> {
+    return this.create(id, {
+      ...data,
+      parentId,
+      resolved: false
+    });
+  }
+
+  resolve(id: string): Promise<unknown> {
+    return this.room.apply([
+      { op: "set", path: `${this.name}.${id}.resolved`, value: true },
+      { op: "set", path: `${this.name}.${id}.updatedAt`, value: Date.now() }
+    ]);
+  }
+
+  reopen(id: string): Promise<unknown> {
+    return this.room.apply([
+      { op: "set", path: `${this.name}.${id}.resolved`, value: false },
+      { op: "set", path: `${this.name}.${id}.updatedAt`, value: Date.now() }
+    ]);
+  }
+}
+
+export class OculusAssets {
+  constructor(
+    private readonly room: Pick<RoomMutationApi, "apply">,
+    private readonly name: string
+  ) {}
+
+  create(id: string, data: Omit<AssetReference, "id">): Promise<unknown> {
+    return this.room.apply([{ op: "set", path: `${this.name}.${id}`, value: { ...data, id } }]);
+  }
+
+  updateMetadata(id: string, metadata: Record<string, unknown>): Promise<unknown> {
+    return this.room.apply([{ op: "set", path: `${this.name}.${id}.metadata`, value: metadata }]);
+  }
+
+  remove(id: string): Promise<unknown> {
+    return this.room.apply([{ op: "delete", path: `${this.name}.${id}` }]);
+  }
+}
+
+export class OculusShapes {
+  constructor(
+    private readonly room: Pick<RoomMutationApi, "apply">,
+    private readonly name: string
+  ) {}
+
+  create(id: string, data: Omit<CanvasShape, "id">): Promise<unknown> {
+    return this.room.apply([{ op: "set", path: `${this.name}.${id}`, value: { ...data, id } }]);
+  }
+
+  change(id: string, data: Partial<CanvasShape>): Promise<unknown> {
+    return this.room.apply(createCollectionOperations(this.name, id, "update", data));
+  }
+
+  move(id: string, x: number, y: number): Promise<unknown> {
+    return this.change(id, { x, y });
+  }
+
+  resize(id: string, width: number, height: number): Promise<unknown> {
+    return this.change(id, { width, height });
+  }
+
+  freehand(
+    id: string,
+    data: { points: CanvasPoint[]; style?: Record<string, unknown>; x?: number; y?: number }
+  ): Promise<unknown> {
+    return this.create(id, {
+      type: "freehand",
+      x: data.x ?? 0,
+      y: data.y ?? 0,
+      points: data.points,
+      style: data.style
+    });
+  }
+}
+
 export function createCollectionOperations(
   collection: string,
   id: string,
@@ -727,6 +1086,86 @@ export function applyOperations<S extends Record<string, unknown>>(
     }
     return setPath(next, operation.path, operation.value) as S;
   }, clone(state));
+}
+
+export function createInverseOperations(
+  state: Record<string, unknown>,
+  operations: Operation[]
+): Operation[] {
+  let current = clone(state);
+  const inverses: Operation[] = [];
+
+  for (const operation of operations) {
+    inverses.unshift(...createInverseOperation(current, operation));
+    current = applyOperations(current, [operation]);
+  }
+
+  return inverses;
+}
+
+function createInverseOperation(state: Record<string, unknown>, operation: Operation): Operation[] {
+  if (operation.op === "delete" || operation.op === "tombstone-delete") {
+    const previous = getPath(state, operation.path);
+    return previous === undefined ? [] : [{ op: "set", path: operation.path, value: previous }];
+  }
+
+  if (operation.op === "text") {
+    const current = typeof getPath(state, operation.path) === "string"
+      ? getPath(state, operation.path) as string
+      : "";
+    const index = clampInteger(operation.value.index ?? current.length, 0, current.length);
+    const deleteCount = clampInteger(operation.value.delete ?? 0, 0, current.length - index);
+    const deletedText = current.slice(index, index + deleteCount);
+    const insertedText = operation.value.insert ?? "";
+    if (!deletedText && !insertedText) return [];
+    return [{
+      op: "text",
+      path: operation.path,
+      value: {
+        index,
+        delete: insertedText.length || undefined,
+        insert: deletedText || undefined
+      }
+    }];
+  }
+
+  if (operation.op === "list-move") {
+    return [{
+      op: "list-move",
+      path: operation.path,
+      value: { from: operation.value.to, to: operation.value.from }
+    }];
+  }
+
+  if (operation.op === "tree-move") {
+    const tree = getPath(state, operation.path);
+    const fromParent = isRecord(tree) && operation.value.fromParentId
+      ? asTreeNode(tree[operation.value.fromParentId])
+      : undefined;
+    const previousIndex = fromParent?.children.indexOf(operation.value.id);
+    return [{
+      op: "tree-move",
+      path: operation.path,
+      value: {
+        id: operation.value.id,
+        fromParentId: operation.value.toParentId,
+        toParentId: operation.value.fromParentId,
+        toIndex: previousIndex === undefined || previousIndex < 0 ? undefined : previousIndex
+      }
+    }];
+  }
+
+  if (operation.op === "lock") {
+    return [{
+      op: "lock",
+      path: operation.path,
+      value: { owner: (getPath(state, operation.path) as string | null | undefined) ?? null }
+    }];
+  }
+
+  const previous = getPath(state, operation.path);
+  if (previous === undefined) return [{ op: "delete", path: operation.path }];
+  return [{ op: "set", path: operation.path, value: previous }];
 }
 
 function getPath(obj: Record<string, unknown>, path: string): unknown {
@@ -833,6 +1272,10 @@ function hasTombstoneAncestor(obj: Record<string, unknown>, path: string): boole
     }
   }
   return false;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function applyListMoveOperation(current: unknown, value: ListMoveOperationValue): unknown[] {

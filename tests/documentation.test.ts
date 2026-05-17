@@ -10,6 +10,11 @@ describe("SDK documentation guardrails", () => {
     expect(sdkDocs).toContain("stateApi.collection");
     expect(sdkDocs).toContain("presence.update");
     expect(sdkDocs).toContain("replayAt");
+    expect(sdkDocs).toContain("diffVersions");
+    expect(sdkDocs).toContain("room.comments");
+    expect(sdkDocs).toContain("room.assets");
+    expect(sdkDocs).toContain("room.shapes");
+    expect(sdkDocs).toContain("defineRoom");
     expect(agentRules).toContain("docs/SDK.md");
     expect(agentRules).toContain("SDK");
   });

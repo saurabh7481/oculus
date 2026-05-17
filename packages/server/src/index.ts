@@ -27,32 +27,43 @@ const { store, storageBackend } = await createStore();
 const coordinator = new RoomCoordinator(store);
 const sockets = new Set<OculusSocket>();
 
-coordinator.defineCollection("nodes", {
-  fields: {
-    x: { strategy: "lww" },
-    y: { strategy: "lww" },
-    label: { strategy: "crdt-text" },
-    lockedBy: {
-      strategy: "custom",
-      resolver: (current, incoming, meta) => {
-        if (current && current !== meta.userId) return current;
-        return incoming;
+coordinator.defineRoom("workflow_123", {
+  collections: {
+    nodes: {
+      fields: {
+        x: { strategy: "lww" },
+        y: { strategy: "lww" },
+        label: { strategy: "crdt-text" },
+        lockedBy: {
+          strategy: "custom",
+          resolver: (current, incoming, meta) => {
+            if (current && current !== meta.userId) return current;
+            return incoming;
+          }
+        }
       }
     }
-  }
+  },
+  permissions: [
+    { path: "nodes.*", operations: ["set", "insert", "delete", "tombstone-delete"], roles: ["editor", "admin"] },
+    { path: "nodes.*.x", operations: ["set", "update"], roles: ["editor", "admin"] },
+    { path: "nodes.*.y", operations: ["set", "update"], roles: ["editor", "admin"] },
+    { path: "nodes.*.color", operations: ["set", "update"], roles: ["editor", "admin"] },
+    { path: "nodes.*.label", operations: ["set", "update", "text"], roles: ["editor", "admin"] },
+    { path: "nodes.*.lockedBy", operations: ["lock", "set", "update"], roles: ["editor", "admin"] },
+    { path: "edges.*", operations: ["set", "insert", "delete", "tombstone-delete"], roles: ["editor", "admin"] },
+    { path: "layers", operations: ["set", "list-move"], roles: ["editor", "admin"] },
+    { path: "tree", operations: ["set", "tree-move"], roles: ["editor", "admin"] }
+  ],
+  edgeValidators: [
+    {
+      edgeCollection: "edges",
+      nodeCollection: "nodes",
+      sourceNodeField: "source",
+      targetNodeField: "target"
+    }
+  ]
 });
-
-coordinator.definePermissions("workflow_123", [
-  { path: "nodes.*", operations: ["set", "insert", "delete", "tombstone-delete"], roles: ["editor", "admin"] },
-  { path: "nodes.*.x", operations: ["set", "update"], roles: ["editor", "admin"] },
-  { path: "nodes.*.y", operations: ["set", "update"], roles: ["editor", "admin"] },
-  { path: "nodes.*.color", operations: ["set", "update"], roles: ["editor", "admin"] },
-  { path: "nodes.*.label", operations: ["set", "update", "text"], roles: ["editor", "admin"] },
-  { path: "nodes.*.lockedBy", operations: ["lock", "set", "update"], roles: ["editor", "admin"] },
-  { path: "edges.*", operations: ["set", "insert", "delete", "tombstone-delete"], roles: ["editor", "admin"] },
-  { path: "layers", operations: ["set", "list-move"], roles: ["editor", "admin"] },
-  { path: "tree", operations: ["set", "tree-move"], roles: ["editor", "admin"] }
-]);
 
 const demoState = {
   nodes: {
@@ -116,6 +127,16 @@ Bun.serve<ClientContext>({
       return json({
         version,
         state: await coordinator.replayAt(roomId, version)
+      });
+    }
+
+    const diffMatch = url.pathname.match(/^\/rooms\/([^/]+)\/diff\/(\d+)\/(\d+)$/);
+    if (diffMatch) {
+      const roomId = decodeURIComponent(diffMatch[1] ?? "");
+      const fromVersion = Number(diffMatch[2]);
+      const toVersion = Number(diffMatch[3]);
+      return json({
+        diff: await coordinator.diffVersions(roomId, fromVersion, toVersion)
       });
     }
 
@@ -193,7 +214,8 @@ async function handleMutation(
     clientId: ws.data.clientId,
     operationId: message.operationId,
     baseVersion: message.baseVersion,
-    operations: message.operations
+    operations: message.operations,
+    metadata: message.metadata
   });
 
   if (result.status === "rejected") {
@@ -222,7 +244,8 @@ async function handleMutation(
       serverVersion: result.serverVersion,
       userId: ws.data.userId,
       clientId: ws.data.clientId,
-      operations: result.transformedOperations as Operation[]
+      operations: result.transformedOperations as Operation[],
+      metadata: message.metadata
     },
     ws
   );

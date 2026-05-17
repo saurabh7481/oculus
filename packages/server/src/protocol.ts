@@ -1,4 +1,4 @@
-import type { Operation } from "./coordinator";
+import type { MutationMetadata, Operation } from "./coordinator";
 
 export type ClientMessage =
   | {
@@ -6,6 +6,7 @@ export type ClientMessage =
       operationId: string;
       baseVersion: number;
       operations: Operation[];
+      metadata?: MutationMetadata;
     }
   | {
       type: "presence";
@@ -38,6 +39,7 @@ export type ServerMessage =
       userId: string;
       clientId: string;
       operations: Operation[];
+      metadata?: MutationMetadata;
     }
   | {
       type: "presence_broadcast";

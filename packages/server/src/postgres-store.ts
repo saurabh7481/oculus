@@ -1,5 +1,5 @@
 import type { Sql } from "postgres";
-import type { EventStore, RoomEvent } from "./coordinator";
+import type { EventStore, MutationMetadata, RoomEvent } from "./coordinator";
 
 type EventRow = {
   room_id: string;
@@ -8,6 +8,7 @@ type EventRow = {
   operation_id: string;
   version: number;
   operations: RoomEvent["operations"];
+  metadata: MutationMetadata | null;
   timestamp_ms: number | string;
 };
 
@@ -42,11 +43,17 @@ export async function migratePostgresEventStore(sql: Sql): Promise<void> {
       client_id text not null,
       operation_id text not null,
       operations jsonb not null,
+      metadata jsonb,
       timestamp_ms bigint not null,
       created_at timestamptz not null default now(),
       primary key (room_id, version),
       unique (room_id, operation_id)
     )
+  `;
+
+  await sql`
+    alter table room_events
+    add column if not exists metadata jsonb
   `;
 
   await sql`
@@ -115,6 +122,7 @@ export class PostgresEventStore implements EventStore {
         client_id,
         operation_id,
         operations,
+        metadata,
         timestamp_ms
       )
       values (
@@ -124,6 +132,7 @@ export class PostgresEventStore implements EventStore {
         ${event.clientId},
         ${event.operationId},
         ${this.json(event.operations)},
+        ${event.metadata ? this.json(event.metadata) : null},
         ${event.timestamp}
       )
     `;
@@ -131,7 +140,7 @@ export class PostgresEventStore implements EventStore {
 
   async getEvents(roomId: string, afterVersion = 0): Promise<RoomEvent[]> {
     const rows = await this.sql<EventRow[]>`
-      select room_id, user_id, client_id, operation_id, version, operations, timestamp_ms
+      select room_id, user_id, client_id, operation_id, version, operations, metadata, timestamp_ms
       from room_events
       where room_id = ${roomId}
         and version > ${afterVersion}
@@ -145,6 +154,7 @@ export class PostgresEventStore implements EventStore {
       operationId: row.operation_id,
       version: row.version,
       operations: clone(row.operations),
+      metadata: row.metadata ? clone(row.metadata) : undefined,
       timestamp: Number(row.timestamp_ms)
     }));
   }
@@ -201,6 +211,30 @@ export class PostgresEventStore implements EventStore {
       values (${roomId}, ${version}, ${this.json(Object.fromEntries(states))})
       on conflict (room_id, version)
       do update set states = excluded.states, created_at = now()
+    `;
+  }
+
+  async pruneSnapshots(roomId: string, keepLatest: number): Promise<void> {
+    const keep = Number.isFinite(keepLatest) ? Math.max(1, Math.trunc(keepLatest)) : 1;
+    await this.sql`
+      delete from room_snapshots
+      where room_id = ${roomId}
+        and version not in (
+          select version
+          from room_snapshots
+          where room_id = ${roomId}
+          order by version desc
+          limit ${keep}
+        )
+    `;
+    await this.sql`
+      delete from room_crdt_text_states
+      where room_id = ${roomId}
+        and version not in (
+          select version
+          from room_snapshots
+          where room_id = ${roomId}
+        )
     `;
   }
 

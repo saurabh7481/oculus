@@ -55,8 +55,14 @@ open http://localhost:5173
 
 ## Next Engineering Milestones
 
-1. Add snapshot compaction policies for repeated LWW updates and long-lived rooms.
-2. Turn the demo replay preview into a full time-travel debugger with diffs between versions.
-3. Add Playwright multi-tab tests for cursor, mutation, reconnect, persistence, permissions, text merge, tombstone deletes, ordered lists, tree moves, and replay behavior.
-4. Add self-hosting polish: `.env.example`, migration commands, backup/restore docs, readiness checks, and production Docker Compose guidance.
-5. Deepen advanced CRDT support beyond text, including Yjs maps/arrays for rich nested document and whiteboard structures.
+1. Build the polished multi-environment demo so the engine capabilities in [docs/recipes/capability-ledger.md](./recipes/capability-ledger.md) are visible across workflow, whiteboard, and design-canvas modes.
+2. Expand Playwright multi-tab tests for transactions, undo/redo, awareness, comments, assets, shapes, schema validation, edge validation, reconnect, persistence, permissions, text merge, tombstone deletes, ordered lists, tree moves, and replay behavior.
+3. Add self-hosting polish: `.env.example`, migration commands, backup/restore docs, readiness checks, and production Docker Compose guidance.
+4. Revisit advanced CRDT maps/arrays only if richer demos reveal conflicts that current primitives cannot solve cleanly.
+
+## Recently Completed
+
+- Snapshot compaction and room lifecycle policies: `RoomCoordinator` can snapshot at a configured interval, retain a bounded number of snapshots, compact a loaded room on demand, and evict idle rooms after saving their latest snapshot.
+- Replay debugger primitives: the server and SDK expose version-to-version diffs with changed paths, before/after values, event details, and reconstructed states. The demo sidebar now shows event metadata and diff details when inspecting replay history.
+- Engine credibility recipes: [docs/recipes](./recipes/README.md) now maps whiteboard, design-canvas, and workflow-builder requirements against current Oculus support.
+- P0/P1 engine credibility APIs: transactions, undo/redo, typed awareness, server room definitions, workflow edge validation, comments, asset references, shape/freehand helpers, server-side schema validation, performance guidance, and CRDT map/array evaluation.
